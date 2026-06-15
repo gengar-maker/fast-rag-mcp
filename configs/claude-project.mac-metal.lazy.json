@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "blazing-code-rag": {
+      "type": "stdio",
+      "command": "/ABSOLUTE/PATH/blazing-rag-mcp-code-fastm4/.venv/bin/brag-mcp",
+      "args": [],
+      "timeout": 600000,
+      "env": {
+        "BRAG_ROOTS": "/ABSOLUTE/PATH/TO/REPOSITORY",
+        "BRAG_DB_DIR": "/ABSOLUTE/PATH/TO/.brag",
+        "BRAG_DEVICE": "mps",
+        "BRAG_FAISS_GPU": "false",
+        "BRAG_VECTOR_BACKEND": "torch",
+        "BRAG_TORCH_VECTOR_DEVICE": "mps",
+        "BRAG_EMBEDDING_MODEL": "nomic-ai/CodeRankEmbed",
+        "BRAG_EMBEDDING_TRUST_REMOTE_CODE": "true",
+        "BRAG_EMBEDDING_ALLOW_HASH_FALLBACK": "false",
+        "BRAG_ALLOW_REINDEX_TOOL": "false",
+        "BRAG_EMBEDDING_BATCH_SIZE": "8",
+        "BRAG_EMBEDDING_FLUSH_CHUNKS": "256",
+        "BRAG_EMBEDDING_MAX_SEQ_LENGTH": "384",
+        "BRAG_EMBEDDING_EMPTY_CACHE_AFTER_ENCODE": "false",
+        "BRAG_CHUNK_TOKENS": "384",
+        "BRAG_CHUNK_OVERLAP": "32",
+        "BRAG_ADD_FILE_SUMMARY_CHUNKS": "false",
+        "BRAG_KEEP_CPU_VECTOR_COPY": "false",
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+        "TOKENIZERS_PARALLELISM": "false"
+      }
+    }
+  }
+}

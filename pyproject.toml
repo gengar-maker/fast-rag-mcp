@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blazing-rag-mcp"
+version = "0.4.1"
+description = "Ultra-fast local code-intelligence RAG MCP server with CUDA, Metal/MPS, and CPU vector acceleration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Konstantin" }]
+dependencies = [
+  "mcp[cli]>=1.12.0",
+  "numpy>=1.26",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "orjson>=3.10",
+  "cachetools>=5.3",
+  "typing-extensions>=4.12",
+]
+
+[project.optional-dependencies]
+embeddings = [
+  "torch>=2.3",
+  "sentence-transformers>=3.0",
+]
+faiss-cpu = ["faiss-cpu>=1.8"]
+code = [
+  "tree-sitter>=0.22",
+  "tree-sitter-language-pack>=0.7.2",
+]
+gpu = [
+  "torch>=2.3",
+  "sentence-transformers>=3.0",
+]
+mac-metal = [
+  "torch>=2.3",
+  "sentence-transformers>=3.0",
+]
+all = [
+  "torch>=2.3",
+  "sentence-transformers>=3.0",
+  "faiss-cpu>=1.8",
+  "tree-sitter>=0.22",
+  "tree-sitter-language-pack>=0.7.2",
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+brag = "blazing_rag_mcp.cli:main"
+brag-mcp = "blazing_rag_mcp.server:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "blazing-rag": {
+      "type": "local",
+      "command": ["uv", "--directory", "/absolute/path/to/blazing-rag-mcp-code-fastm4", "run", "brag-mcp"],
+      "environment": {
+        "BRAG_ROOTS": "/absolute/path/to/your/repo",
+        "BRAG_DB_DIR": "/absolute/path/to/your/repo/.brag",
+        "BRAG_DEVICE": "mps",
+        "BRAG_VECTOR_BACKEND": "torch",
+        "BRAG_TORCH_VECTOR_DEVICE": "mps",
+        "BRAG_FAISS_GPU": "false",
+        "BRAG_EMBEDDING_MODEL": "nomic-ai/CodeRankEmbed",
+        "BRAG_EMBEDDING_TRUST_REMOTE_CODE": "true",
+        "BRAG_EMBEDDING_ALLOW_HASH_FALLBACK": "false",
+        "BRAG_EMBEDDING_BATCH_SIZE": "16",
+        "BRAG_EMBEDDING_FLUSH_CHUNKS": "512",
+        "BRAG_EMBEDDING_MAX_SEQ_LENGTH": "384",
+        "BRAG_EMBEDDING_EMPTY_CACHE_AFTER_ENCODE": "false",
+        "BRAG_ADD_FILE_SUMMARY_CHUNKS": "false"
+      }
+    }
+  }
+}
