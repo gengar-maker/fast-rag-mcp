@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict
 from typing import Literal
@@ -45,7 +46,7 @@ class Retriever:
         return self.code_search(
             query=query,
             top_k=top_k,
-            mode="code" if mode == "auto" else mode,
+            mode=mode,
             path_prefix=path_prefix,
             include_text=include_text,
         )
@@ -61,13 +62,14 @@ class Retriever:
         self.ensure_fresh_index()
         started = time.perf_counter()
         top_k = min(max(1, top_k or self.settings.default_top_k), self.settings.max_top_k)
+        requested_mode = mode
         mode = "code" if mode == "auto" else mode
         cache_key = json.dumps(
             {
                 "v": self.store.corpus_version(),
                 "q": query,
                 "k": top_k,
-                "mode": mode,
+                "mode": requested_mode,
                 "path_prefix": path_prefix,
                 "include_text": include_text,
             },
@@ -96,7 +98,18 @@ class Retriever:
             path_chunks = self._path_hits_to_chunks(path_hits)
             timings["symbol_path_ms"] = _ms(t0)
 
-        if mode in ("code", "hybrid", "semantic"):
+        exact_symbol_hit = bool(symbol_hits and float(symbol_hits[0].get("score", 0.0)) >= 100.0)
+        identifier_query = bool(re.fullmatch(r"[A-Za-z_$][\w$]*(?:[.:][A-Za-z_$][\w$]*)*", query.strip()))
+        skip_dense = bool(
+            requested_mode == "auto"
+            and self.settings.exact_symbol_fast_path
+            and exact_symbol_hit
+            and identifier_query
+        )
+        if skip_dense:
+            timings["route"] = "exact-symbol-fast-path"
+
+        if mode in ("code", "hybrid", "semantic") and not skip_dense:
             t0 = time.perf_counter()
             qvec = self.embeddings.embed_query(query)
             timings["embed_ms"] = _ms(t0)
@@ -120,7 +133,7 @@ class Retriever:
         result = {
             "query": query,
             "corpus_version": self.store.corpus_version(),
-            "mode": mode,
+            "mode": "exact-symbol-fast-path" if skip_dense else mode,
             "cached": False,
             "results": results,
             "symbol_hits_preview": [self._pack_symbol(s, compact=True) for s in symbol_hits[: min(8, top_k)]],

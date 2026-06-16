@@ -14,30 +14,44 @@ import numpy as np
 
 from .types import Chunk, CodeReference, CodeSymbol, Document
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
-def adapt_array(arr: np.ndarray) -> bytes:
-    return np.asarray(arr, dtype="float32").tobytes(order="C")
+def adapt_array(arr: np.ndarray, dtype: str = "float32") -> bytes:
+    np_dtype = np.float16 if dtype == "float16" else np.float32
+    return np.asarray(arr, dtype=np_dtype).tobytes(order="C")
 
 
-def decode_array(blob: bytes, dim: int) -> np.ndarray:
-    return np.frombuffer(blob, dtype="float32").reshape(dim)
+def decode_array(blob: bytes, dim: int, dtype: str | None = None) -> np.ndarray:
+    if dtype not in {"float16", "float32"}:
+        dtype = "float16" if len(blob) == dim * 2 else "float32"
+    np_dtype = np.float16 if dtype == "float16" else np.float32
+    return np.frombuffer(blob, dtype=np_dtype, count=dim).reshape(dim)
 
 
 class Store:
-    def __init__(self, db_dir: Path):
+    def __init__(self, db_dir: Path, *, vector_storage_dtype: str = "float32", bulk_build: bool = False):
         self.db_dir = db_dir.expanduser().resolve()
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.db_dir / "rag.sqlite3"
+        self.vector_storage_dtype = vector_storage_dtype if vector_storage_dtype in {"float16", "float32"} else "float32"
+        self.bulk_build = bulk_build
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        # Avoid surprising RSS spikes during large indexing runs. Users who want aggressive
-        # SQLite caching can set PRAGMAs externally or patch these values for their host.
-        self.conn.execute("PRAGMA temp_store=DEFAULT")
-        self.conn.execute("PRAGMA mmap_size=67108864")
+        if bulk_build:
+            # A forced rebuild writes to a disposable staging DB. Durability comes from the final
+            # atomic swap, so disabling WAL/fsync here substantially accelerates FTS/vector writes.
+            self.conn.execute("PRAGMA journal_mode=OFF")
+            self.conn.execute("PRAGMA synchronous=OFF")
+            self.conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+            self.conn.execute("PRAGMA temp_store=MEMORY")
+            self.conn.execute("PRAGMA cache_size=-262144")
+            self.conn.execute("PRAGMA mmap_size=268435456")
+        else:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA temp_store=DEFAULT")
+            self.conn.execute("PRAGMA mmap_size=134217728")
         self._init_schema()
 
     def checkpoint(self) -> None:
@@ -98,6 +112,7 @@ class Store:
               symbol_id TEXT NOT NULL DEFAULT '',
               symbol_name TEXT NOT NULL DEFAULT '',
               qualified_name TEXT NOT NULL DEFAULT '',
+              embedding_hash TEXT NOT NULL DEFAULT '',
               FOREIGN KEY(doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE
             );
 
@@ -141,6 +156,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS vectors (
               chunk_id TEXT PRIMARY KEY,
               dim INTEGER NOT NULL,
+              dtype TEXT NOT NULL DEFAULT 'float32',
               vector BLOB NOT NULL,
               FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
             );
@@ -170,6 +186,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
             CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_qualified ON chunks(qualified_name);
+            CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hash ON chunks(embedding_hash);
             CREATE INDEX IF NOT EXISTS idx_docs_path ON docs(path);
             CREATE INDEX IF NOT EXISTS idx_symbols_doc ON symbols(doc_id);
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -187,8 +204,10 @@ class Store:
             "symbol_id": "TEXT NOT NULL DEFAULT ''",
             "symbol_name": "TEXT NOT NULL DEFAULT ''",
             "qualified_name": "TEXT NOT NULL DEFAULT ''",
+            "embedding_hash": "TEXT NOT NULL DEFAULT ''",
         }.items():
             self._ensure_column("chunks", name, ddl)
+        self._ensure_column("vectors", "dtype", "TEXT NOT NULL DEFAULT 'float32'")
         self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
         self.conn.commit()
 
@@ -213,6 +232,25 @@ class Store:
         self.set_meta("corpus_version", version)
         return version
 
+    def document_manifest(self) -> dict[str, dict]:
+        rows = self.conn.execute(
+            "SELECT doc_id, root, path, content_hash, mtime_ns, size_bytes FROM docs"
+        ).fetchall()
+        return {str(r["doc_id"]): dict(r) for r in rows}
+
+    def touch_document(self, doc: Document) -> None:
+        self.touch_documents([doc])
+
+    def touch_documents(self, docs: Sequence[Document]) -> None:
+        if not docs:
+            return
+        now = time.time()
+        with self.transaction() as conn:
+            conn.executemany(
+                "UPDATE docs SET content_hash=?, mtime_ns=?, size_bytes=?, indexed_at=? WHERE doc_id=?",
+                [(d.content_hash, d.mtime_ns, d.size_bytes, now, d.doc_id) for d in docs],
+            )
+
     def doc_is_current(self, doc: Document) -> bool:
         row = self.conn.execute(
             "SELECT content_hash, mtime_ns, size_bytes FROM docs WHERE doc_id=?", (doc.doc_id,)
@@ -223,6 +261,26 @@ class Store:
             and int(row["mtime_ns"]) == int(doc.mtime_ns)
             and int(row["size_bytes"]) == int(doc.size_bytes)
         )
+
+    def document_vector_cache(self, doc_id: str) -> dict[str, np.ndarray]:
+        """Return old vectors keyed by semantic embedding hash for one document.
+
+        This lets a one-line edit reuse embeddings for every unchanged function/chunk in the file.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT c.embedding_hash, v.dim, v.dtype, v.vector
+            FROM chunks c JOIN vectors v ON v.chunk_id=c.id
+            WHERE c.doc_id=? AND c.embedding_hash<>''
+            """,
+            (doc_id,),
+        ).fetchall()
+        out: dict[str, np.ndarray] = {}
+        for row in rows:
+            key = str(row["embedding_hash"])
+            if key and key not in out:
+                out[key] = decode_array(row["vector"], int(row["dim"]), str(row["dtype"])).astype("float32", copy=True)
+        return out
 
     def upsert_document(
         self,
@@ -263,16 +321,22 @@ class Store:
             return
         with self.transaction() as conn:
             doc_ids = [doc.doc_id for doc, *_ in payloads]
-            placeholders = ",".join("?" for _ in doc_ids)
-            existing = [
-                str(row["doc_id"])
-                for row in conn.execute(
-                    f"SELECT doc_id FROM docs WHERE doc_id IN ({placeholders})",
-                    doc_ids,
-                ).fetchall()
-            ]
+            existing: list[str] = []
+            if not self.bulk_build:
+                # Stay below SQLite's host-parameter limit even for batches of tiny files.
+                for start in range(0, len(doc_ids), 800):
+                    part = doc_ids[start : start + 800]
+                    placeholders = ",".join("?" for _ in part)
+                    existing.extend(
+                        str(row["doc_id"])
+                        for row in conn.execute(
+                            f"SELECT doc_id FROM docs WHERE doc_id IN ({placeholders})",
+                            part,
+                        ).fetchall()
+                    )
             if existing:
-                self._delete_docs_payload(conn, existing)
+                for start in range(0, len(existing), 800):
+                    self._delete_docs_payload(conn, existing[start : start + 800])
             for doc, chunks, vectors, symbols, references in payloads:
                 self._upsert_document_on_conn(
                     conn,
@@ -323,6 +387,7 @@ class Store:
             symbol_id = str(meta.get("symbol_id", ""))
             symbol_name = str(meta.get("symbol_name", ""))
             qualified_name = str(meta.get("qualified_name", ""))
+            embedding_hash = str(meta.get("embedding_hash", ""))
             chunk_rows.append(
                 (
                     chunk.id,
@@ -344,9 +409,10 @@ class Store:
                     symbol_id,
                     symbol_name,
                     qualified_name,
+                    embedding_hash,
                 )
             )
-            vector_rows.append((chunk.id, dim, adapt_array(vectors[ord_])))
+            vector_rows.append((chunk.id, dim, self.vector_storage_dtype, adapt_array(vectors[ord_], self.vector_storage_dtype)))
             fts_text = "\n".join(x for x in [qualified_name, symbol_name, chunk.text] if x)
             fts_rows.append((chunk.id, chunk.title, chunk.section, chunk.path, fts_text))
 
@@ -355,13 +421,13 @@ class Store:
             INSERT INTO chunks(
               id, doc_id, root, path, title, section, text, line_start, line_end,
               byte_start, byte_end, content_hash, metadata_json, ord,
-              language, chunk_type, symbol_id, symbol_name, qualified_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              language, chunk_type, symbol_id, symbol_name, qualified_name, embedding_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             chunk_rows,
         )
         conn.executemany(
-            "INSERT INTO vectors(chunk_id, dim, vector) VALUES (?, ?, ?)",
+            "INSERT INTO vectors(chunk_id, dim, dtype, vector) VALUES (?, ?, ?, ?)",
             vector_rows,
         )
         conn.executemany(
@@ -463,10 +529,18 @@ class Store:
                 pass
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA temp_store=DEFAULT")
-        self.conn.execute("PRAGMA mmap_size=67108864")
+        if self.bulk_build:
+            self.conn.execute("PRAGMA journal_mode=OFF")
+            self.conn.execute("PRAGMA synchronous=OFF")
+            self.conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+            self.conn.execute("PRAGMA temp_store=MEMORY")
+            self.conn.execute("PRAGMA cache_size=-262144")
+            self.conn.execute("PRAGMA mmap_size=268435456")
+        else:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA temp_store=DEFAULT")
+            self.conn.execute("PRAGMA mmap_size=134217728")
         self._init_schema()
 
     def _delete_docs_payload(self, conn: sqlite3.Connection, doc_ids: Sequence[str]) -> None:
@@ -510,7 +584,9 @@ class Store:
         return len(stale)
 
     def all_vectors(self) -> tuple[list[str], np.ndarray]:
-        meta = self.conn.execute("SELECT COUNT(*) AS n, MIN(dim) AS min_dim, MAX(dim) AS max_dim FROM vectors").fetchone()
+        meta = self.conn.execute(
+            "SELECT COUNT(*) AS n, MIN(dim) AS min_dim, MAX(dim) AS max_dim FROM vectors"
+        ).fetchone()
         n = int(meta["n"] or 0) if meta else 0
         if n <= 0:
             return [], np.zeros((0, 0), dtype="float32")
@@ -520,19 +596,19 @@ class Store:
             raise ValueError(f"inconsistent vector dimensions: min={min_dim} max={max_dim}")
 
         dim = min_dim
+        target_dtype = np.float16 if self.vector_storage_dtype == "float16" else np.float32
         ids: list[str] = []
-        matrix = np.empty((n, dim), dtype="float32")
-        cur = self.conn.execute("SELECT chunk_id, dim, vector FROM vectors ORDER BY chunk_id")
+        matrix = np.empty((n, dim), dtype=target_dtype)
+        cur = self.conn.execute("SELECT chunk_id, dim, dtype, vector FROM vectors ORDER BY chunk_id")
         row_idx = 0
         while True:
-            batch = cur.fetchmany(4096)
+            batch = cur.fetchmany(8192)
             if not batch:
                 break
             for row in batch:
                 ids.append(str(row["chunk_id"]))
-                # Copy from SQLite's immutable bytes buffer into the preallocated matrix.
-                # This avoids fetchall()+list-of-arrays+vstack peak memory amplification.
-                matrix[row_idx, :] = np.frombuffer(row["vector"], dtype="float32", count=dim)
+                decoded = decode_array(row["vector"], dim, str(row["dtype"]))
+                matrix[row_idx, :] = decoded.astype(target_dtype, copy=False)
                 row_idx += 1
         if row_idx != n:
             ids = ids[:row_idx]
@@ -792,6 +868,16 @@ class Store:
             return '""'
         # OR improves recall; exact paths/symbols still score well with bm25.
         return " OR ".join(f'"{t}"' for t in terms[:32])
+
+    def optimize(self) -> None:
+        """Finalize an index after a full/staging build."""
+        try:
+            self.conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
+            self.conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('optimize')")
+            self.conn.execute("ANALYZE")
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
 
     def stats(self) -> dict:
         docs = self.conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()["c"]

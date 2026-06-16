@@ -16,7 +16,7 @@ def _split_paths(value: str | list[str]) -> list[str]:
 
 
 class Settings(BaseSettings):
-    """Runtime configuration, primarily via BRAG_* env vars."""
+    """Runtime configuration, primarily via BRAG_* environment variables."""
 
     model_config = SettingsConfigDict(env_prefix="BRAG_", env_file=".env", extra="ignore")
 
@@ -31,8 +31,6 @@ class Settings(BaseSettings):
         "**/*.json", "**/*.yaml", "**/*.yml", "**/*.toml",
         "**/*.sql", "**/*.sh", "**/*.bash", "**/*.zsh", "**/*.dockerfile", "**/Dockerfile",
     ])
-    # Be aggressively conservative by default. Code agents usually want source, not dependency
-    # trees, caches, virtualenvs, generated bundles, local indexes, or model downloads.
     exclude_dirs: set[str] = Field(default_factory=lambda: {
         ".git", ".hg", ".svn",
         ".brag", ".rag", ".index", ".indexes",
@@ -53,18 +51,23 @@ class Settings(BaseSettings):
     include_hidden_dir_names: set[str] = Field(default_factory=lambda: {".github"})
     max_file_bytes: int = 750_000
     max_files: int = 250_000
+    scan_backend: Literal["auto", "git", "walk"] = "auto"
+    fast_stat_skip: bool = True
 
-    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
-    embedding_trust_remote_code: bool = False
+    embedding_model: str = "nomic-ai/CodeRankEmbed"
+    embedding_trust_remote_code: bool = True
     embedding_query_prefix: str = ""
     embedding_allow_hash_fallback: bool = True
     device: str = "auto"  # auto | cuda | mps | cpu
     normalize_embeddings: bool = True
-    embedding_batch_size: int = 8
-    embedding_flush_chunks: int = 256
-    embedding_max_seq_length: int = 512
+    embedding_batch_size: int = 16
+    embedding_flush_chunks: int = 512
+    embedding_max_seq_length: int = 384
     embedding_precision: Literal["auto", "float32", "float16", "bfloat16"] = "auto"
     embedding_empty_cache_after_encode: bool = False
+    embedding_reuse_unchanged_chunks: bool = True
+    tokenizer_parallelism: bool = True
+    tokenizer_threads: int = 8
     query_cache_size: int = 4096
 
     chunk_tokens: int = 384
@@ -77,11 +80,14 @@ class Settings(BaseSettings):
     code_map_limit: int = 240
 
     vector_backend: Literal["auto", "faiss", "torch", "numpy"] = "auto"
+    vector_storage_dtype: Literal["float16", "float32"] = "float16"
     faiss_gpu: bool = True
     torch_vector_device: str = "auto"  # auto | cuda | mps | cpu
+    torch_vector_dtype: Literal["auto", "float16", "float32"] = "auto"
     torch_vector_max_vectors: int = 1_000_000
+    mps_vector_min_vectors: int = 30_000
     keep_cpu_vector_copy: bool = False
-    vector_load_batch_size: int = 4096
+    vector_load_batch_size: int = 8192
     exact_search_threshold: int = 80_000
     fts_weight: float = 0.38
     dense_weight: float = 0.50
@@ -92,6 +98,7 @@ class Settings(BaseSettings):
     candidate_k: int = 120
     max_snippet_chars: int = 700
     max_fetch_chars: int = 16_000
+    exact_symbol_fast_path: bool = True
 
     read_only: bool = True
     allow_reindex_tool: bool = False

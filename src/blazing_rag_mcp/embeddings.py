@@ -13,19 +13,7 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
-# These must be set before torch initializes MPS/CUDA to be maximally effective. Users can
-# override them in their shell. They are intentionally conservative for indexing workflows.
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-
-
-def _has_torch_cuda() -> bool:
-    try:
-        import torch
-
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
 
 
 def resolve_device(device: str) -> str:
@@ -52,15 +40,11 @@ class EmbeddingInfo:
     provider: str
     max_seq_length: int
     precision: str
+    batch_size: int = 0
 
 
 class EmbeddingModel:
-    """GPU-aware embedding wrapper with a deterministic fallback.
-
-    Memory defaults are intentionally conservative. On Apple Silicon, Activity Monitor reports
-    PyTorch MPS unified-memory allocations under the Python process, so large embedding batches can
-    look like Python RSS explosions. Keep batch size and max sequence length bounded.
-    """
+    """GPU-aware embedding wrapper with bounded memory and persistent-compatible fingerprints."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -70,7 +54,12 @@ class EmbeddingModel:
         self._dim = 384
         self._precision = "none"
         self._max_seq_length = int(settings.embedding_max_seq_length)
+        self._effective_batch_size = max(1, int(settings.embedding_batch_size))
         self._cache: LRUCache[str, np.ndarray] = LRUCache(maxsize=settings.query_cache_size)
+
+        os.environ["TOKENIZERS_PARALLELISM"] = "true" if settings.tokenizer_parallelism else "false"
+        if settings.tokenizer_threads > 0:
+            os.environ.setdefault("RAYON_NUM_THREADS", str(settings.tokenizer_threads))
         self._load_sentence_transformer()
 
     def _desired_torch_dtype(self):
@@ -101,8 +90,6 @@ class EmbeddingModel:
                 trust_remote_code=self.settings.embedding_trust_remote_code,
                 **kwargs,
             )
-            # Hard cap the transformer sequence length. This is the main protection against MPS/CUDA
-            # activation-memory spikes during indexing.
             try:
                 current = int(getattr(self._model, "max_seq_length", self._max_seq_length) or self._max_seq_length)
                 self._model.max_seq_length = min(current, self._max_seq_length)
@@ -119,19 +106,19 @@ class EmbeddingModel:
             self._precision = precision_name
             self._max_seq_length = int(getattr(self._model, "max_seq_length", self._max_seq_length) or self._max_seq_length)
             log.warning(
-                "loaded embedding model=%s device=%s dim=%s precision=%s max_seq_length=%s batch_size=%s",
+                "loaded embedding model=%s device=%s dim=%s precision=%s max_seq_length=%s batch_size=%s tokenizer_threads=%s",
                 self.settings.embedding_model,
                 self.device,
                 self._dim,
                 self._precision,
                 self._max_seq_length,
-                self.settings.embedding_batch_size,
+                self._effective_batch_size,
+                self.settings.tokenizer_threads,
             )
         except Exception as exc:
             if not self.settings.embedding_allow_hash_fallback:
                 raise RuntimeError(
-                    f"failed to load embedding model {self.settings.embedding_model!r}; "
-                    "hash fallback is disabled"
+                    f"failed to load embedding model {self.settings.embedding_model!r}; hash fallback is disabled"
                 ) from exc
             log.warning("sentence-transformers unavailable; using hash fallback: %s", exc)
 
@@ -145,7 +132,27 @@ class EmbeddingModel:
             provider=self._provider,
             max_seq_length=self._max_seq_length,
             precision=self._precision,
+            batch_size=self._effective_batch_size,
         )
+
+    @property
+    def index_key(self) -> str:
+        return "|".join(
+            [
+                self.settings.embedding_model,
+                self._provider,
+                str(self._dim),
+                str(self.settings.normalize_embeddings),
+                str(self._max_seq_length),
+                self._precision,
+            ]
+        )
+
+    def embedding_hash(self, text: str) -> str:
+        return hashlib.blake2b(
+            f"{self.index_key}\x1f{text}".encode("utf-8", "ignore"),
+            digest_size=20,
+        ).hexdigest()
 
     def _normalize(self, arr: np.ndarray) -> np.ndarray:
         if not self.settings.normalize_embeddings:
@@ -176,18 +183,22 @@ class EmbeddingModel:
                 prefix = "Represent this query for searching relevant code:"
             if prefix:
                 texts = [f"{prefix} {text}" for text in texts]
+
         if self._model is not None:
             try:
                 import torch
-
                 context_factory = torch.inference_mode
             except Exception:
                 context_factory = _NullContext
-            batch_size = max(1, int(self.settings.embedding_batch_size))
+
+            batch_size = self._effective_batch_size
             while True:
                 try:
                     with context_factory():
-                        encoder = getattr(self._model, "encode_document", self._model.encode)
+                        if is_query:
+                            encoder = getattr(self._model, "encode_query", self._model.encode)
+                        else:
+                            encoder = getattr(self._model, "encode_document", self._model.encode)
                         arr = encoder(
                             texts,
                             batch_size=batch_size,
@@ -195,13 +206,15 @@ class EmbeddingModel:
                             convert_to_numpy=True,
                             show_progress_bar=False,
                         )
+                    self._effective_batch_size = batch_size
                     break
                 except RuntimeError as exc:
                     message = str(exc).lower()
                     if batch_size <= 1 or not any(token in message for token in ("out of memory", "mps backend", "allocation")):
                         raise
                     batch_size = max(1, batch_size // 2)
-                    log.warning("embedding OOM/allocation failure; retrying with batch_size=%s", batch_size)
+                    self._effective_batch_size = batch_size
+                    log.warning("embedding allocation failure; retrying with batch_size=%s", batch_size)
                     self._empty_device_cache(force=True)
             self._empty_device_cache()
             return np.asarray(arr, dtype="float32")
@@ -209,7 +222,7 @@ class EmbeddingModel:
 
     def embed_query(self, query: str) -> np.ndarray:
         key = hashlib.blake2b(
-            f"{self.settings.embedding_model}\x1f{self.settings.normalize_embeddings}\x1f{query}".encode(),
+            f"{self.index_key}\x1fquery\x1f{query}".encode(),
             digest_size=16,
         ).hexdigest()
         cached = self._cache.get(key)
@@ -218,6 +231,55 @@ class EmbeddingModel:
         arr = self.embed_texts([query], is_query=True)[0]
         self._cache[key] = arr
         return arr
+
+    def warmup(self) -> None:
+        self.embed_texts(["def warmup(value):\n    return value"], is_query=False)
+        self.embed_query("warmup function")
+
+    def benchmark_batch_sizes(self, texts: list[str], candidates: list[int]) -> dict:
+        import time
+
+        if not texts:
+            raise ValueError("no benchmark texts")
+        original = self._effective_batch_size
+        results: list[dict] = []
+        best_batch = original
+        best_rate = 0.0
+        # Warm kernels/tokenizer once before measuring.
+        self.embed_texts(texts[: min(8, len(texts))])
+        for candidate in candidates:
+            if candidate <= 0:
+                continue
+            self._effective_batch_size = candidate
+            started = time.perf_counter()
+            try:
+                self.embed_texts(texts)
+                elapsed = time.perf_counter() - started
+                rate = len(texts) / elapsed if elapsed else 0.0
+                results.append({
+                    "batch_size": candidate,
+                    "elapsed_ms": round(elapsed * 1000, 3),
+                    "texts_per_second": round(rate, 3),
+                    "ok": True,
+                })
+                if rate > best_rate:
+                    best_rate = rate
+                    best_batch = self._effective_batch_size
+            except Exception as exc:
+                results.append({
+                    "batch_size": candidate,
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                self._empty_device_cache(force=True)
+        self._effective_batch_size = best_batch
+        return {
+            "sample_texts": len(texts),
+            "results": results,
+            "recommended_batch_size": best_batch,
+            "recommended_rate": round(best_rate, 3),
+            "previous_batch_size": original,
+        }
 
     def _hash_embed(self, texts: Iterable[str]) -> np.ndarray:
         if not isinstance(texts, list):

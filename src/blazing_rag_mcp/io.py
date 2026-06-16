@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
@@ -20,6 +21,7 @@ TEXT_EXTENSIONS = {
 @dataclass(slots=True)
 class ScanStats:
     roots: list[str] = field(default_factory=list)
+    backends: dict[str, str] = field(default_factory=dict)
     files_seen: int = 0
     files_yielded: int = 0
     dirs_skipped: int = 0
@@ -36,6 +38,7 @@ class ScanStats:
     def as_dict(self) -> dict:
         return {
             "roots": self.roots,
+            "backends": self.backends,
             "files_seen": self.files_seen,
             "files_yielded": self.files_yielded,
             "dirs_skipped": self.dirs_skipped,
@@ -55,6 +58,10 @@ def stable_id(*parts: str, n: int = 20) -> str:
     return h[:n]
 
 
+def document_id(root: Path, path: Path) -> str:
+    return stable_id(root.resolve().as_posix(), path.resolve().relative_to(root.resolve()).as_posix())
+
+
 def is_binary_sample(data: bytes) -> bool:
     if b"\0" in data:
         return True
@@ -69,18 +76,17 @@ def _matches_any(name: str, patterns: set[str]) -> bool:
 
 
 def should_skip_dir(path: Path, settings: Settings) -> bool:
-    parts = path.parts
     db_dir = settings.resolved_db_dir()
     try:
         path.resolve().relative_to(db_dir)
         return True
     except Exception:
         pass
-    for part in parts:
-        if _matches_any(part, settings.exclude_dirs):
-            return True
-        if settings.exclude_hidden_dirs and part.startswith(".") and part not in settings.include_hidden_dir_names:
-            return True
+    name = path.name
+    if _matches_any(name, settings.exclude_dirs):
+        return True
+    if settings.exclude_hidden_dirs and name.startswith(".") and name not in settings.include_hidden_dir_names:
+        return True
     return False
 
 
@@ -88,59 +94,136 @@ def matches_include(rel_path: str, settings: Settings) -> bool:
     return any(fnmatch(rel_path, pat) for pat in settings.include_globs)
 
 
-def iter_candidate_files(settings: Settings, stats: ScanStats | None = None) -> Iterator[Path]:
-    """Yield candidate files without materializing the whole repo in memory.
+def _accept_file(root: Path, path: Path, settings: Settings, stats: ScanStats | None) -> bool:
+    if stats is not None:
+        stats.files_seen += 1
+    try:
+        rel = path.relative_to(root).as_posix()
+        if any(_matches_any(part, settings.exclude_dirs) for part in Path(rel).parts[:-1]):
+            if stats is not None:
+                stats.files_skipped_pattern += 1
+            return False
+        st = path.stat()
+        if not path.is_file() or st.st_size > settings.max_file_bytes:
+            if stats is not None and st.st_size > settings.max_file_bytes:
+                stats.files_skipped_size += 1
+                stats.add_largest(st.st_size, path)
+            return False
+        if not matches_include(rel, settings) and path.suffix.lower() not in TEXT_EXTENSIONS:
+            if stats is not None:
+                stats.files_skipped_pattern += 1
+            return False
+        if stats is not None:
+            stats.files_yielded += 1
+            stats.add_largest(st.st_size, path)
+        return True
+    except OSError:
+        if stats is not None:
+            stats.errors += 1
+        return False
 
-    This also refuses to descend into the configured DB directory even if the user names it
-    something other than `.brag`.
+
+def _git_paths(root: Path) -> Iterator[Path]:
+    proc = subprocess.run(
+        ["git", "-C", root.as_posix(), "ls-files", "-co", "--exclude-standard", "-z"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=True,
+        timeout=30,
+    )
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8", "surrogateescape")
+        yield root / rel
+
+
+def _can_use_git(root: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root.as_posix(), "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+            text=True,
+        )
+        return proc.returncode == 0 and proc.stdout.strip() == "true"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def iter_candidate_files_with_roots(
+    settings: Settings,
+    stats: ScanStats | None = None,
+) -> Iterator[tuple[Path, Path]]:
+    """Yield ``(root, path)`` pairs without materializing the repository.
+
+    Git repositories use ``git ls-files -co --exclude-standard`` by default. This is much faster
+    than a recursive Python walk for large repositories and automatically respects .gitignore.
     """
     roots = settings.resolved_roots()
     if stats is not None:
         stats.roots = [p.as_posix() for p in roots]
+    yielded = 0
+    seen: set[str] = set()
+
     for root in roots:
         root = root.resolve()
+        use_git = settings.scan_backend == "git" or (
+            settings.scan_backend == "auto" and _can_use_git(root)
+        )
+        if use_git:
+            try:
+                iterator = _git_paths(root)
+                if stats is not None:
+                    stats.backends[root.as_posix()] = "git"
+                for path in iterator:
+                    key = path.resolve().as_posix()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if _accept_file(root, path, settings, stats):
+                        yield root, path
+                        yielded += 1
+                        if yielded >= settings.max_files:
+                            return
+                continue
+            except (OSError, subprocess.SubprocessError):
+                if settings.scan_backend == "git":
+                    raise
+
+        if stats is not None:
+            stats.backends[root.as_posix()] = "walk"
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dpath = Path(dirpath)
-            before = len(dirnames)
             kept_dirs: list[str] = []
-            for d in dirnames:
-                child = dpath / d
+            for dirname in dirnames:
+                child = dpath / dirname
                 if should_skip_dir(child, settings):
                     if stats is not None:
                         stats.dirs_skipped += 1
                     continue
-                kept_dirs.append(d)
+                kept_dirs.append(dirname)
             dirnames[:] = kept_dirs
-            if stats is not None:
-                stats.dirs_skipped += max(0, before - len(kept_dirs))
             if should_skip_dir(dpath, settings):
                 continue
             for name in sorted(filenames):
                 path = dpath / name
-                if stats is not None:
-                    stats.files_seen += 1
-                try:
-                    rel = path.relative_to(root).as_posix()
-                    st = path.stat()
-                    if st.st_size > settings.max_file_bytes:
-                        if stats is not None:
-                            stats.files_skipped_size += 1
-                            stats.add_largest(st.st_size, path)
-                        continue
-                    if not matches_include(rel, settings) and path.suffix.lower() not in TEXT_EXTENSIONS:
-                        if stats is not None:
-                            stats.files_skipped_pattern += 1
-                        continue
-                    if stats is not None:
-                        stats.files_yielded += 1
-                        stats.add_largest(st.st_size, path)
-                    yield path
-                    if stats is not None and stats.files_yielded >= settings.max_files:
-                        return
-                except OSError:
-                    if stats is not None:
-                        stats.errors += 1
+                key = path.resolve().as_posix()
+                if key in seen:
                     continue
+                seen.add(key)
+                if _accept_file(root, path, settings, stats):
+                    yield root, path
+                    yielded += 1
+                    if yielded >= settings.max_files:
+                        return
+
+
+def iter_candidate_files(settings: Settings, stats: ScanStats | None = None) -> Iterator[Path]:
+    for _, path in iter_candidate_files_with_roots(settings, stats):
+        yield path
 
 
 def read_document(root: Path, path: Path, settings: Settings) -> Document | None:
@@ -160,9 +243,8 @@ def read_document(root: Path, path: Path, settings: Settings) -> Document | None
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     content_hash = sha256_bytes(data)
     rel_path = path.relative_to(root).as_posix()
-    doc_id = stable_id(root.as_posix(), rel_path)
     return Document(
-        doc_id=doc_id,
+        doc_id=document_id(root, path),
         root=root,
         path=path,
         rel_path=rel_path,

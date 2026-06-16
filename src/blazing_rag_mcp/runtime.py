@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 class Runtime:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings()
-        self.store = Store(self.settings.db_dir)
+        self.store = Store(self.settings.db_dir, vector_storage_dtype=self.settings.vector_storage_dtype)
         self.embeddings = EmbeddingModel(self.settings)
         self.vector_index = VectorIndex(self.settings)
         self.indexer = Indexer(self.settings, self.store, self.embeddings)
@@ -47,10 +47,11 @@ class Runtime:
             )
         )
         staging_settings = self.settings.model_copy(update={"db_dir": staging_dir})
-        staging_store = Store(staging_dir)
+        staging_store = Store(staging_dir, vector_storage_dtype=self.settings.vector_storage_dtype, bulk_build=True)
         try:
             staging_indexer = Indexer(staging_settings, staging_store, self.embeddings)
             result = staging_indexer.index_all(force=False)
+            staging_store.optimize()
             staging_store.checkpoint()
             staging_store.close()
 
@@ -60,7 +61,7 @@ class Runtime:
             self.store.close()
             replace_index_database(staging_dir, target_dir)
 
-            self.store = Store(target_dir)
+            self.store = Store(target_dir, vector_storage_dtype=self.settings.vector_storage_dtype)
             self.indexer = Indexer(self.settings, self.store, self.embeddings)
             self.vector_index = VectorIndex(self.settings)
             vector_reload = self.reload_vector_index()
@@ -79,7 +80,7 @@ class Runtime:
             try:
                 self.store.stats()
             except Exception:
-                self.store = Store(target_dir)
+                self.store = Store(target_dir, vector_storage_dtype=self.settings.vector_storage_dtype)
                 self.indexer = Indexer(self.settings, self.store, self.embeddings)
                 self.vector_index = VectorIndex(self.settings)
                 self.reload_vector_index()

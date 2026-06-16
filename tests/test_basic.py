@@ -137,3 +137,73 @@ def test_cross_file_embedding_batching(tmp_path):
     assert result["docs_changed"] == 12
     assert result["throughput"]["embedding_calls"] == 1
     assert embeddings.calls == 1
+
+
+def test_incremental_reuses_unchanged_chunk_embeddings(tmp_path):
+    import hashlib
+    import os
+    import numpy as np
+
+    class FakeEmbeddings:
+        def __init__(self):
+            from blazing_rag_mcp.embeddings import EmbeddingInfo
+            self.calls = 0
+            self.texts = 0
+            self.info = EmbeddingInfo(
+                model="fake", device="cpu", dim=8, normalized=True,
+                provider="fake", max_seq_length=64, precision="float32", batch_size=32,
+            )
+
+        def embedding_hash(self, text):
+            return hashlib.blake2b(text.encode(), digest_size=20).hexdigest()
+
+        def embed_texts(self, texts, *, is_query=False):
+            self.calls += 1
+            self.texts += len(texts)
+            rows = []
+            for text in texts:
+                digest = hashlib.blake2b(text.encode(), digest_size=8).digest()
+                row = np.frombuffer(digest, dtype=np.uint8).astype("float32")
+                row /= max(np.linalg.norm(row), 1e-12)
+                rows.append(row)
+            return np.stack(rows)
+
+    repo = tmp_path / "repo"
+    db = tmp_path / "db"
+    repo.mkdir()
+    source = repo / "module.py"
+    source.write_text(
+        "def unchanged(value):\n    return value + 1\n\n"
+        "def changed(value):\n    return value + 2\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        roots=[repo.as_posix()], db_dir=db, min_chunk_chars=10,
+        embedding_flush_chunks=128, vector_backend="numpy",
+        vector_storage_dtype="float16", scan_backend="walk",
+    )
+    store = Store(db, vector_storage_dtype="float16")
+    embeddings = FakeEmbeddings()
+    first = Indexer(settings, store, embeddings).index_all()
+    assert first["chunks_embedded"] > 0
+
+    second = Indexer(settings, store, embeddings).index_all()
+    assert second["docs_changed"] == 0
+    assert second["chunks_embedded"] == 0
+
+    old_texts = embeddings.texts
+    source.write_text(
+        "def unchanged(value):\n    return value + 1\n\n"
+        "def changed(value):\n    return value + 200\n",
+        encoding="utf-8",
+    )
+    os.utime(source, None)
+    third = Indexer(settings, store, embeddings).index_all()
+    assert third["docs_changed"] == 1
+    assert third["chunks_reused"] >= 1
+    assert third["chunks_embedded"] < third["chunks_written"]
+    assert embeddings.texts > old_texts
+
+    ids, matrix = store.all_vectors()
+    assert ids
+    assert matrix.dtype == np.float16

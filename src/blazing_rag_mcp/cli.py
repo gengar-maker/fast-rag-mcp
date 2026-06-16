@@ -51,11 +51,12 @@ def _index_command(*, force: bool = False, build_vector_index: bool = False) -> 
             )
             index_settings = settings.model_copy(update={"db_dir": staging_dir})
 
-        store = Store(index_settings.db_dir)
+        store = Store(index_settings.db_dir, vector_storage_dtype=index_settings.vector_storage_dtype, bulk_build=force)
         indexer = Indexer(index_settings, store, embeddings)
         result = indexer.index_all(force=False)
 
         if force:
+            store.optimize()
             store.checkpoint()
             store.close()
             store = None
@@ -66,7 +67,7 @@ def _index_command(*, force: bool = False, build_vector_index: bool = False) -> 
             result["full_rebuild"] = False
 
         if build_vector_index:
-            final_store = Store(settings.db_dir)
+            final_store = Store(settings.db_dir, vector_storage_dtype=settings.vector_storage_dtype)
             try:
                 vector_index = VectorIndex(settings)
                 final_indexer = Indexer(settings, final_store, embeddings)
@@ -100,7 +101,7 @@ def _status_command(*, runtime: bool = False) -> None:
         return
 
     settings = Settings()
-    store = Store(settings.db_dir)
+    store = Store(settings.db_dir, vector_storage_dtype=settings.vector_storage_dtype)
     try:
         _print_json({
             "settings": {
@@ -147,6 +148,38 @@ def _scan_command() -> None:
     })
 
 
+
+def _tune_command(sample_chunks: int, batch_sizes: str) -> None:
+    """Benchmark embedding batch sizes on real chunks without modifying the index."""
+    from .chunking import chunk_document
+    from .code_index import extract_symbols
+    from .indexer import _embedding_text
+    from .io import ScanStats, iter_candidate_files_with_roots, read_document
+
+    settings = Settings()
+    embeddings = EmbeddingModel(settings)
+    stats = ScanStats()
+    texts: list[str] = []
+    for root, path in iter_candidate_files_with_roots(settings, stats):
+        doc = read_document(root, path, settings)
+        if doc is None:
+            continue
+        symbols = extract_symbols(doc)
+        chunks = chunk_document(doc, settings, symbols=symbols)
+        for chunk in chunks:
+            texts.append(_embedding_text(chunk))
+            if len(texts) >= sample_chunks:
+                break
+        if len(texts) >= sample_chunks:
+            break
+    candidates = [int(x.strip()) for x in batch_sizes.split(",") if x.strip()]
+    result = embeddings.benchmark_batch_sizes(texts, candidates)
+    result["scan"] = stats.as_dict()
+    result["device"] = embeddings.info.device
+    result["model"] = embeddings.info.model
+    _print_json(result)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="brag", description="Blazing local code/RAG MCP server")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -161,6 +194,10 @@ def main() -> None:
 
     sub.add_parser("scan", help="Scan files that would be indexed without loading the embedding model")
 
+    p_tune = sub.add_parser("tune", help="Benchmark embedding batch sizes on representative code chunks")
+    p_tune.add_argument("--sample-chunks", type=int, default=128)
+    p_tune.add_argument("--batch-sizes", default="8,16,24,32,48,64")
+
     p_status = sub.add_parser("status", help="Show index/runtime status")
     p_status.add_argument(
         "--runtime",
@@ -171,7 +208,7 @@ def main() -> None:
     p_search = sub.add_parser("search", help="Code-aware hybrid search without MCP")
     p_search.add_argument("query")
     p_search.add_argument("--top-k", type=int, default=None)
-    p_search.add_argument("--mode", choices=["auto", "code", "hybrid", "semantic", "keyword", "symbol"], default="code")
+    p_search.add_argument("--mode", choices=["auto", "code", "hybrid", "semantic", "keyword", "symbol"], default="auto")
     p_search.add_argument("--path-prefix", default=None)
     p_search.add_argument("--include-text", action="store_true")
 
@@ -213,6 +250,10 @@ def main() -> None:
 
     if args.cmd == "scan":
         _scan_command()
+        return
+
+    if args.cmd == "tune":
+        _tune_command(args.sample_chunks, args.batch_sizes)
         return
 
     from .runtime import Runtime

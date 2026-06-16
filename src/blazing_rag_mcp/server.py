@@ -50,7 +50,7 @@ def _lightweight_status() -> dict:
     from .store import Store
 
     settings = Settings()
-    store = Store(settings.db_dir)
+    store = Store(settings.db_dir, vector_storage_dtype=settings.vector_storage_dtype)
     try:
         return {
             "ok": True,
@@ -76,7 +76,7 @@ def _lightweight_status() -> dict:
 def code_search(
     query: str,
     top_k: int | None = None,
-    mode: Literal["auto", "code", "hybrid", "semantic", "keyword", "symbol"] = "code",
+    mode: Literal["auto", "code", "hybrid", "semantic", "keyword", "symbol"] = "auto",
     path_prefix: str | None = None,
     include_text: bool = False,
 ) -> dict:
@@ -192,6 +192,7 @@ def rag_warmup() -> dict:
     """Explicitly initialize the embedding model and vector index after MCP has connected."""
     try:
         runtime = _get_runtime()
+        runtime.embeddings.warmup()
         return {
             "ok": True,
             "runtime_init_ms": _runtime_init_ms,
