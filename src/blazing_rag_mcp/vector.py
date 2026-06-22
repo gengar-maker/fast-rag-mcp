@@ -54,11 +54,17 @@ class VectorIndex:
             return
 
         backend = self.settings.vector_backend
-        torch_device = _resolve_torch_vector_device(self.settings.torch_vector_device, self.settings.device)
+        torch_device = _resolve_torch_vector_device(
+            self.settings.torch_vector_device, self.settings.device
+        )
 
         # For small/medium local code indexes, Accelerate-backed float32 GEMV is usually faster
         # than paying an MPS command-buffer launch + synchronization for every query.
-        if backend == "auto" and torch_device == "mps" and len(ids) < self.settings.mps_vector_min_vectors:
+        if (
+            backend == "auto"
+            and torch_device == "mps"
+            and len(ids) < self.settings.mps_vector_min_vectors
+        ):
             self.matrix = np.asarray(raw, dtype="float32", order="C")
             self.dtype = "float32"
             log.warning(
@@ -106,7 +112,9 @@ class VectorIndex:
                 self.settings.torch_vector_max_vectors,
             )
             return False
-        device = _resolve_torch_vector_device(self.settings.torch_vector_device, self.settings.device)
+        device = _resolve_torch_vector_device(
+            self.settings.torch_vector_device, self.settings.device
+        )
         if device == "cpu":
             return False
         try:
@@ -114,13 +122,19 @@ class VectorIndex:
 
             if device == "cuda" and not torch.cuda.is_available():
                 return False
-            if device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            if device == "mps" and not (
+                hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            ):
                 return False
             dtype_name = self.settings.torch_vector_dtype
             if dtype_name == "auto":
                 dtype_name = "float16" if device in {"mps", "cuda"} else "float32"
             torch_dtype = torch.float16 if dtype_name == "float16" else torch.float32
-            cpu_source = np.asarray(self.matrix, dtype=np.float16 if torch_dtype == torch.float16 else np.float32, order="C")
+            cpu_source = np.asarray(
+                self.matrix,
+                dtype=np.float16 if torch_dtype == torch.float16 else np.float32,
+                order="C",
+            )
             mat = torch.as_tensor(cpu_source, dtype=torch_dtype, device=device).contiguous()
             probe = torch.as_tensor(cpu_source[:1], dtype=torch_dtype, device=device)
             _ = torch.topk(mat @ probe[0], k=1)
@@ -135,7 +149,11 @@ class VectorIndex:
             self._release_cpu_matrix_if_allowed()
             log.warning(
                 "built Torch %s exact vector index vectors=%s dim=%s dtype=%s keep_cpu_copy=%s",
-                device.upper(), n, self.dim, dtype_name, self.settings.keep_cpu_vector_copy,
+                device.upper(),
+                n,
+                self.dim,
+                dtype_name,
+                self.settings.keep_cpu_vector_copy,
             )
             return True
         except Exception as exc:
@@ -146,7 +164,7 @@ class VectorIndex:
 
     def _build_faiss(self) -> bool:
         try:
-            import faiss  # type: ignore
+            import faiss
         except Exception as exc:
             if self.settings.vector_backend == "faiss":
                 log.warning("faiss requested but unavailable: %s", exc)
@@ -165,12 +183,15 @@ class VectorIndex:
                     else:
                         nlist = _choose_nlist(n)
                         quantizer = faiss.IndexFlatIP(dim)
-                        cpu_index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
+                        cpu_index = faiss.IndexIVFFlat(
+                            quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT
+                        )
                         cpu_index.nprobe = min(64, max(8, nlist // 16))
                         cpu_index.train(_training_sample(matrix, max_train=min(n, nlist * 256)))
                         self.exact = False
-                    self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-                    self.index.add(matrix)
+                    gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+                    gpu_index.add(matrix)
+                    self.index = gpu_index
                     self.backend = "faiss-gpu"
                     self.gpu = True
                     self.dtype = "float32"
@@ -242,7 +263,9 @@ class VectorIndex:
 
 
 def _faiss_gpu_available(faiss_module: object) -> bool:
-    return hasattr(faiss_module, "StandardGpuResources") and hasattr(faiss_module, "index_cpu_to_gpu")
+    return hasattr(faiss_module, "StandardGpuResources") and hasattr(
+        faiss_module, "index_cpu_to_gpu"
+    )
 
 
 def _resolve_torch_vector_device(torch_vector_device: str, embedding_device: str) -> str:
@@ -252,6 +275,7 @@ def _resolve_torch_vector_device(torch_vector_device: str, embedding_device: str
     if requested == "auto":
         try:
             import torch
+
             if torch.cuda.is_available():
                 return "cuda"
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -263,7 +287,7 @@ def _resolve_torch_vector_device(torch_vector_device: str, embedding_device: str
 
 
 def _choose_nlist(n: int) -> int:
-    raw = int(max(64, min(8192, round(n ** 0.5 * 4))))
+    raw = int(max(64, min(8192, round(n**0.5 * 4))))
     return max(64, (raw // 32) * 32)
 
 

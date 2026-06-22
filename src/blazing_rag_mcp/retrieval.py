@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import Literal
 
@@ -17,21 +18,29 @@ Mode = Literal["auto", "code", "hybrid", "semantic", "keyword", "symbol"]
 
 
 class Retriever:
-    def __init__(self, settings: Settings, store: Store, embeddings: EmbeddingModel, vector_index: VectorIndex):
+    def __init__(
+        self,
+        settings: Settings,
+        store: Store,
+        embedding_provider: EmbeddingModel | Callable[[], EmbeddingModel],
+        vector_provider: VectorIndex | Callable[[], VectorIndex],
+    ):
         self.settings = settings
         self.store = store
-        self.embeddings = embeddings
-        self.vector_index = vector_index
+        self._embedding_provider = embedding_provider
+        self._vector_provider = vector_provider
         self._search_cache: LRUCache[str, dict] = LRUCache(maxsize=1024)
-        self._loaded_version = store.corpus_version()
 
-    def ensure_fresh_index(self) -> None:
-        version = self.store.corpus_version()
-        if version != self._loaded_version:
-            ids, vectors = self.store.all_vectors()
-            self.vector_index.build(ids, vectors)
-            self._loaded_version = version
-            self._search_cache.clear()
+    def _embeddings(self) -> EmbeddingModel:
+        source = self._embedding_provider
+        return source() if callable(source) else source
+
+    def _vector_index(self) -> VectorIndex:
+        source = self._vector_provider
+        return source() if callable(source) else source
+
+    def clear_cache(self) -> None:
+        self._search_cache.clear()
 
     def search(
         self,
@@ -59,7 +68,6 @@ class Retriever:
         path_prefix: str | None = None,
         include_text: bool = False,
     ) -> dict:
-        self.ensure_fresh_index()
         started = time.perf_counter()
         top_k = min(max(1, top_k or self.settings.default_top_k), self.settings.max_top_k)
         requested_mode = mode
@@ -82,7 +90,7 @@ class Retriever:
             result["cached"] = True
             return result
 
-        timings: dict[str, float] = {}
+        timings: dict[str, float | str] = {}
         dense: list[tuple[str, float]] = []
         sparse: list[tuple[str, float]] = []
         symbol_chunks: list[tuple[str, float]] = []
@@ -92,14 +100,20 @@ class Retriever:
 
         if mode in ("code", "hybrid", "symbol"):
             t0 = time.perf_counter()
-            symbol_hits = self.store.symbol_search(query, self.settings.candidate_k, path_prefix=path_prefix)
+            symbol_hits = self.store.symbol_search(
+                query, self.settings.candidate_k, path_prefix=path_prefix
+            )
             symbol_chunks = self._symbol_hits_to_chunks(symbol_hits)
-            path_hits = self.store.path_search(query, min(self.settings.candidate_k, 50), path_prefix=path_prefix)
+            path_hits = self.store.path_search(
+                query, min(self.settings.candidate_k, 50), path_prefix=path_prefix
+            )
             path_chunks = self._path_hits_to_chunks(path_hits)
             timings["symbol_path_ms"] = _ms(t0)
 
         exact_symbol_hit = bool(symbol_hits and float(symbol_hits[0].get("score", 0.0)) >= 100.0)
-        identifier_query = bool(re.fullmatch(r"[A-Za-z_$][\w$]*(?:[.:][A-Za-z_$][\w$]*)*", query.strip()))
+        identifier_query = bool(
+            re.fullmatch(r"[A-Za-z_$][\w$]*(?:[.:][A-Za-z_$][\w$]*)*", query.strip())
+        )
         skip_dense = bool(
             requested_mode == "auto"
             and self.settings.exact_symbol_fast_path
@@ -111,15 +125,19 @@ class Retriever:
 
         if mode in ("code", "hybrid", "semantic") and not skip_dense:
             t0 = time.perf_counter()
-            qvec = self.embeddings.embed_query(query)
+            embeddings = self._embeddings()
+            qvec = embeddings.embed_query(query)
             timings["embed_ms"] = _ms(t0)
             t0 = time.perf_counter()
-            dense = self.vector_index.search(qvec, self.settings.candidate_k)
+            vector_index = self._vector_index()
+            dense = vector_index.search(qvec, self.settings.candidate_k)
             timings["dense_ms"] = _ms(t0)
 
         if mode in ("code", "hybrid", "keyword"):
             t0 = time.perf_counter()
-            sparse = self.store.fts_search(query, self.settings.candidate_k, path_prefix=path_prefix)
+            sparse = self.store.fts_search(
+                query, self.settings.candidate_k, path_prefix=path_prefix
+            )
             timings["fts_ms"] = _ms(t0)
 
         t0 = time.perf_counter()
@@ -136,11 +154,23 @@ class Retriever:
             "mode": "exact-symbol-fast-path" if skip_dense else mode,
             "cached": False,
             "results": results,
-            "symbol_hits_preview": [self._pack_symbol(s, compact=True) for s in symbol_hits[: min(8, top_k)]],
-            "path_hits_preview": [{"path": p["path"], "doc_id": p["doc_id"]} for p in path_hits[: min(8, top_k)]],
+            "symbol_hits_preview": [
+                self._pack_symbol(s, compact=True) for s in symbol_hits[: min(8, top_k)]
+            ],
+            "path_hits_preview": [
+                {"path": p["path"], "doc_id": p["doc_id"]} for p in path_hits[: min(8, top_k)]
+            ],
             "timings_ms": {**timings, "total_ms": _ms(started)},
-            "index": asdict(self.vector_index.info()),
-            "embedding": asdict(self.embeddings.info),
+            "index": (
+                asdict(vector_index.info())
+                if "vector_index" in locals()
+                else {"loaded": False, "reason": "dense retrieval was not required"}
+            ),
+            "embedding": (
+                asdict(embeddings.info)
+                if "embeddings" in locals()
+                else {"loaded": False, "reason": "exact/sparse retrieval path"}
+            ),
         }
         self._search_cache[cache_key] = result
         return result
@@ -152,7 +182,6 @@ class Retriever:
         path_prefix: str | None = None,
         limit: int | None = None,
     ) -> dict:
-        self.ensure_fresh_index()
         started = time.perf_counter()
         limit = min(max(1, limit or self.settings.default_top_k), self.settings.max_top_k)
         rows = self.store.symbol_search(name, limit, path_prefix=path_prefix, kind=kind)
@@ -163,32 +192,51 @@ class Retriever:
             "timings_ms": {"total_ms": _ms(started)},
         }
 
-    def references(self, symbol: str, path_prefix: str | None = None, limit: int | None = None) -> dict:
-        self.ensure_fresh_index()
+    def references(
+        self, symbol: str, path_prefix: str | None = None, limit: int | None = None
+    ) -> dict:
         started = time.perf_counter()
-        limit = min(max(1, limit or self.settings.code_reference_limit), self.settings.code_reference_limit * 4)
-        sym = self.store.get_symbol(symbol) or self.store.get_symbol_by_name(symbol, path_prefix=path_prefix)
+        limit = min(
+            max(1, limit or self.settings.code_reference_limit),
+            self.settings.code_reference_limit * 4,
+        )
+        sym = self.store.get_symbol(symbol) or self.store.get_symbol_by_name(
+            symbol, path_prefix=path_prefix
+        )
         target = sym["name"] if sym else symbol.split(".")[-1]
         refs = self.store.find_references(target, limit, path_prefix=path_prefix)
         fallback_chunks: list[dict] = []
         if not refs:
-            fts = self.store.fts_search(target, min(limit, self.settings.candidate_k), path_prefix=path_prefix)
+            fts = self.store.fts_search(
+                target, min(limit, self.settings.candidate_k), path_prefix=path_prefix
+            )
             fallback_chunks = self.store.get_chunks([cid for cid, _ in fts[:limit]])
         return {
             "symbol": self._pack_symbol(sym) if sym else {"query": symbol, "resolved": False},
             "target_name": target,
             "references": [self._pack_reference(r) for r in refs],
-            "fallback_search_results": [self._pack_chunk(c, 0.0, include_text=False) for c in fallback_chunks[:limit]],
+            "fallback_search_results": [
+                self._pack_chunk(c, 0.0, include_text=False) for c in fallback_chunks[:limit]
+            ],
             "timings_ms": {"total_ms": _ms(started)},
         }
 
     def neighbors(self, symbol: str, path_prefix: str | None = None, limit: int = 40) -> dict:
-        self.ensure_fresh_index()
         started = time.perf_counter()
-        sym = self.store.get_symbol(symbol) or self.store.get_symbol_by_name(symbol, path_prefix=path_prefix)
+        sym = self.store.get_symbol(symbol) or self.store.get_symbol_by_name(
+            symbol, path_prefix=path_prefix
+        )
         if not sym:
-            return {"symbol": {"query": symbol, "resolved": False}, "neighbors": {}, "timings_ms": {"total_ms": _ms(started)}}
-        siblings = [s for s in self.store.symbols_in_doc(sym["doc_id"], limit=limit * 3) if s["id"] != sym["id"]]
+            return {
+                "symbol": {"query": symbol, "resolved": False},
+                "neighbors": {},
+                "timings_ms": {"total_ms": _ms(started)},
+            }
+        siblings = [
+            s
+            for s in self.store.symbols_in_doc(sym["doc_id"], limit=limit * 3)
+            if s["id"] != sym["id"]
+        ]
         outgoing_refs = self.store.find_references(sym["name"], limit, path_prefix=path_prefix)
         # Incoming callers: any reference to this symbol name; source_symbol_id lets the agent jump to caller.
         callers = []
@@ -202,13 +250,14 @@ class Retriever:
             "neighbors": {
                 "same_file_symbols": [self._pack_symbol(s, compact=True) for s in siblings[:limit]],
                 "references_to_symbol": [self._pack_reference(r) for r in outgoing_refs[:limit]],
-                "callers_or_containing_symbols": [self._pack_symbol(c, compact=True) for c in callers[:limit]],
+                "callers_or_containing_symbols": [
+                    self._pack_symbol(c, compact=True) for c in callers[:limit]
+                ],
             },
             "timings_ms": {"total_ms": _ms(started)},
         }
 
     def repo_map(self, path_prefix: str | None = None, limit: int | None = None) -> dict:
-        self.ensure_fresh_index()
         limit = min(max(1, limit or self.settings.code_map_limit), self.settings.code_map_limit * 3)
         started = time.perf_counter()
         out = self.store.repo_map(path_prefix=path_prefix, limit=limit)
@@ -223,7 +272,6 @@ class Retriever:
         symbol_id: str | None = None,
         context_chunks: int = 0,
     ) -> dict:
-        self.ensure_fresh_index()
         sid = symbol_id or _symbol_id_from_uri(resource_uri or "")
         if sid:
             sym = self.store.get_symbol(sid)
@@ -232,7 +280,11 @@ class Retriever:
             text = sym["text"]
             if len(text) > self.settings.max_fetch_chars:
                 text = text[: self.settings.max_fetch_chars] + "\n...[truncated]"
-            return {**self._pack_symbol(sym), "text": text, "metadata": _loads(sym.get("metadata_json", "{}"))}
+            return {
+                **self._pack_symbol(sym),
+                "text": text,
+                "metadata": _loads(sym.get("metadata_json", "{}")),
+            }
 
         cid = chunk_id or _chunk_id_from_uri(resource_uri or "")
         if not cid:
@@ -297,7 +349,11 @@ class Retriever:
 
         def add(results: list[tuple[str, float]], weight: float, raw_scale: float = 0.0) -> None:
             for rank, (cid, raw) in enumerate(results, start=1):
-                scores[cid] = scores.get(cid, 0.0) + weight / (rrf_k + rank) + raw_scale * max(0.0, float(raw))
+                scores[cid] = (
+                    scores.get(cid, 0.0)
+                    + weight / (rrf_k + rank)
+                    + raw_scale * max(0.0, float(raw))
+                )
 
         add(symbol_chunks, self.settings.code_symbol_weight, raw_scale=0.0005)
         add(path_chunks, self.settings.code_path_weight)
@@ -360,7 +416,9 @@ class Retriever:
             "path": ref["path"],
             "language": ref["language"],
             "source_symbol_id": ref.get("source_symbol_id", ""),
-            "source_symbol_uri": f"symbol://{ref['source_symbol_id']}" if ref.get("source_symbol_id") else "",
+            "source_symbol_uri": f"symbol://{ref['source_symbol_id']}"
+            if ref.get("source_symbol_id")
+            else "",
             "target_name": ref["target_name"],
             "ref_kind": ref["ref_kind"],
             "line": ref["line"],

@@ -6,15 +6,15 @@ import re
 import shutil
 import sqlite3
 import time
-from contextlib import contextmanager
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Iterator, Sequence
 
 import numpy as np
 
 from .types import Chunk, CodeReference, CodeSymbol, Document
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def adapt_array(arr: np.ndarray, dtype: str = "float32") -> bytes:
@@ -30,43 +30,89 @@ def decode_array(blob: bytes, dim: int, dtype: str | None = None) -> np.ndarray:
 
 
 class Store:
-    def __init__(self, db_dir: Path, *, vector_storage_dtype: str = "float32", bulk_build: bool = False):
+    def __init__(
+        self,
+        db_dir: Path,
+        *,
+        vector_storage_dtype: str = "float32",
+        bulk_build: bool = False,
+        timeout_seconds: float = 30.0,
+        busy_timeout_ms: int = 30_000,
+        cache_kib: int = 131_072,
+        mmap_bytes: int = 268_435_456,
+        vector_load_batch_size: int = 8192,
+        read_only: bool = False,
+    ):
         self.db_dir = db_dir.expanduser().resolve()
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.db_dir / "rag.sqlite3"
-        self.vector_storage_dtype = vector_storage_dtype if vector_storage_dtype in {"float16", "float32"} else "float32"
+        self.vector_storage_dtype = (
+            vector_storage_dtype if vector_storage_dtype in {"float16", "float32"} else "float32"
+        )
         self.bulk_build = bulk_build
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        if bulk_build:
-            # A forced rebuild writes to a disposable staging DB. Durability comes from the final
-            # atomic swap, so disabling WAL/fsync here substantially accelerates FTS/vector writes.
-            self.conn.execute("PRAGMA journal_mode=OFF")
-            self.conn.execute("PRAGMA synchronous=OFF")
-            self.conn.execute("PRAGMA locking_mode=EXCLUSIVE")
-            self.conn.execute("PRAGMA temp_store=MEMORY")
-            self.conn.execute("PRAGMA cache_size=-262144")
-            self.conn.execute("PRAGMA mmap_size=268435456")
+        self.timeout_seconds = float(timeout_seconds)
+        self.busy_timeout_ms = max(1, int(busy_timeout_ms))
+        self.cache_kib = max(1, int(cache_kib))
+        self.mmap_bytes = max(0, int(mmap_bytes))
+        self.vector_load_batch_size = max(1, int(vector_load_batch_size))
+        self.read_only = bool(read_only)
+        if self.read_only and not self.path.is_file():
+            raise FileNotFoundError(
+                f"index database does not exist: {self.path}; run `brag index --force`"
+            )
+        self.conn = self._connect()
+        if not self.read_only:
+            self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        database: str = self.path.as_posix()
+        uri = False
+        if self.read_only:
+            database = f"{self.path.as_uri()}?mode=ro"
+            uri = True
+        conn = sqlite3.connect(
+            database,
+            timeout=self.timeout_seconds,
+            check_same_thread=False,
+            isolation_level=None,
+            uri=uri,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        if self.read_only:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute(f"PRAGMA cache_size=-{self.cache_kib}")
+            conn.execute(f"PRAGMA mmap_size={self.mmap_bytes}")
+        elif self.bulk_build:
+            # The staging DB is disposable and atomically swapped only after success.
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute(f"PRAGMA cache_size=-{self.cache_kib}")
+            conn.execute(f"PRAGMA mmap_size={self.mmap_bytes}")
         else:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
-            self.conn.execute("PRAGMA temp_store=DEFAULT")
-            self.conn.execute("PRAGMA mmap_size=134217728")
-        self._init_schema()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=DEFAULT")
+            conn.execute(f"PRAGMA cache_size=-{self.cache_kib}")
+            conn.execute(f"PRAGMA mmap_size={self.mmap_bytes}")
+        return conn
 
     def checkpoint(self) -> None:
-        try:
+        if self.read_only:
+            return
+        with suppress(sqlite3.Error):
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error:
-            pass
 
     def close(self) -> None:
         self.conn.close()
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
         try:
-            self.conn.execute("BEGIN")
+            self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield self.conn
             self.conn.commit()
         except Exception:
@@ -181,20 +227,6 @@ class Store:
               text,
               tokenize='unicode61 remove_diacritics 2'
             );
-
-            CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
-            CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
-            CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol_id);
-            CREATE INDEX IF NOT EXISTS idx_chunks_qualified ON chunks(qualified_name);
-            CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hash ON chunks(embedding_hash);
-            CREATE INDEX IF NOT EXISTS idx_docs_path ON docs(path);
-            CREATE INDEX IF NOT EXISTS idx_symbols_doc ON symbols(doc_id);
-            CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
-            CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qualified_name);
-            CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
-            CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_name_lc);
-            CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_symbol_id);
-            CREATE INDEX IF NOT EXISTS idx_refs_path ON refs(path);
             """
         )
         # Best-effort migration for databases created by earlier scaffold versions.
@@ -208,7 +240,36 @@ class Store:
         }.items():
             self._ensure_column("chunks", name, ddl)
         self._ensure_column("vectors", "dtype", "TEXT NOT NULL DEFAULT 'float32'")
-        self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+        self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
+            CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_qualified ON chunks(qualified_name);
+            CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hash ON chunks(embedding_hash);
+            CREATE INDEX IF NOT EXISTS idx_docs_path ON docs(path);
+            CREATE INDEX IF NOT EXISTS idx_symbols_doc ON symbols(doc_id);
+            CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(name COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_symbols_qname_nocase ON symbols(qualified_name COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
+            CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_name_lc);
+            CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_refs_path ON refs(path);
+            """
+        )
+        current = self.get_meta("schema_version", "0")
+        try:
+            current_version = int(current or "0")
+        except ValueError:
+            current_version = 0
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"index schema {current_version} is newer than supported schema {SCHEMA_VERSION}"
+            )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
@@ -221,16 +282,75 @@ class Store:
         return row["value"] if row else default
 
     def set_meta(self, key: str, value: str) -> None:
-        self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
-        self.conn.commit()
+        with self.transaction() as conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
+
+    def set_meta_many(self, values: dict[str, str]) -> None:
+        if not values:
+            return
+        with self.transaction() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                list(values.items()),
+            )
 
     def corpus_version(self) -> str:
         return self.get_meta("corpus_version", "empty")
 
     def mark_corpus_changed(self) -> str:
-        version = f"{int(time.time() * 1000)}"
+        version = str(time.time_ns())
         self.set_meta("corpus_version", version)
         return version
+
+    def document_count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()
+        return int(row["c"] if row else 0)
+
+    def validate_index_fingerprint(self, expected: str, *, allow_empty: bool = True) -> None:
+        if allow_empty and self.document_count() == 0:
+            return
+        current = self.get_meta("index_fingerprint", "")
+        if not current:
+            raise RuntimeError(
+                "existing index has no compatibility fingerprint; run `brag index --force` once"
+            )
+        if current != expected:
+            raise RuntimeError(
+                "index configuration changed (embedding/chunking/storage); run `brag index --force`"
+            )
+
+    def record_index_metadata(
+        self, *, fingerprint: str, embedding_key: str, embedding_dim: int
+    ) -> None:
+        self.set_meta_many(
+            {
+                "index_fingerprint": fingerprint,
+                "embedding_key": embedding_key,
+                "embedding_dim": str(int(embedding_dim)),
+                "index_state": "ready",
+            }
+        )
+
+    def begin_index_run(self) -> None:
+        self.set_meta_many({"index_state": "building", "index_started_ns": str(time.time_ns())})
+
+    def fail_index_run(self, error: str) -> None:
+        self.set_meta_many(
+            {
+                "index_state": "failed",
+                "index_last_error": error[:2000],
+                "index_finished_ns": str(time.time_ns()),
+            }
+        )
+
+    def finish_index_run(self, *, degraded: bool = False) -> None:
+        self.set_meta_many(
+            {
+                "index_state": "degraded" if degraded else "ready",
+                "index_last_error": "",
+                "index_finished_ns": str(time.time_ns()),
+            }
+        )
 
     def document_manifest(self) -> dict[str, dict]:
         rows = self.conn.execute(
@@ -279,7 +399,9 @@ class Store:
         for row in rows:
             key = str(row["embedding_hash"])
             if key and key not in out:
-                out[key] = decode_array(row["vector"], int(row["dim"]), str(row["dtype"])).astype("float32", copy=True)
+                out[key] = decode_array(row["vector"], int(row["dim"]), str(row["dtype"])).astype(
+                    "float32", copy=True
+                )
         return out
 
     def upsert_document(
@@ -330,7 +452,7 @@ class Store:
                     existing.extend(
                         str(row["doc_id"])
                         for row in conn.execute(
-                            f"SELECT doc_id FROM docs WHERE doc_id IN ({placeholders})",
+                            f"SELECT doc_id FROM docs WHERE doc_id IN ({placeholders})",  # nosec B608
                             part,
                         ).fetchall()
                     )
@@ -374,7 +496,16 @@ class Store:
             INSERT OR REPLACE INTO docs(doc_id, root, path, title, content_hash, mtime_ns, size_bytes, indexed_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (doc.doc_id, doc.root.as_posix(), doc.rel_path, doc.title, doc.content_hash, doc.mtime_ns, doc.size_bytes, now),
+            (
+                doc.doc_id,
+                doc.root.as_posix(),
+                doc.rel_path,
+                doc.title,
+                doc.content_hash,
+                doc.mtime_ns,
+                doc.size_bytes,
+                now,
+            ),
         )
 
         chunk_rows = []
@@ -412,7 +543,14 @@ class Store:
                     embedding_hash,
                 )
             )
-            vector_rows.append((chunk.id, dim, self.vector_storage_dtype, adapt_array(vectors[ord_], self.vector_storage_dtype)))
+            vector_rows.append(
+                (
+                    chunk.id,
+                    dim,
+                    self.vector_storage_dtype,
+                    adapt_array(vectors[ord_], self.vector_storage_dtype),
+                )
+            )
             fts_text = "\n".join(x for x in [qualified_name, symbol_name, chunk.text] if x)
             fts_rows.append((chunk.id, chunk.title, chunk.section, chunk.path, fts_text))
 
@@ -523,24 +661,9 @@ class Store:
         """
         self.conn.close()
         for candidate in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
-            try:
+            with suppress(FileNotFoundError):
                 candidate.unlink()
-            except FileNotFoundError:
-                pass
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        if self.bulk_build:
-            self.conn.execute("PRAGMA journal_mode=OFF")
-            self.conn.execute("PRAGMA synchronous=OFF")
-            self.conn.execute("PRAGMA locking_mode=EXCLUSIVE")
-            self.conn.execute("PRAGMA temp_store=MEMORY")
-            self.conn.execute("PRAGMA cache_size=-262144")
-            self.conn.execute("PRAGMA mmap_size=268435456")
-        else:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
-            self.conn.execute("PRAGMA temp_store=DEFAULT")
-            self.conn.execute("PRAGMA mmap_size=134217728")
+        self.conn = self._connect()
         self._init_schema()
 
     def _delete_docs_payload(self, conn: sqlite3.Connection, doc_ids: Sequence[str]) -> None:
@@ -549,39 +672,64 @@ class Store:
         placeholders = ",".join("?" for _ in doc_ids)
         params = tuple(doc_ids)
         conn.execute(
-            f"DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id IN ({placeholders}))",
+            f"DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id IN ({placeholders}))",  # nosec B608
             params,
         )
         conn.execute(
-            f"DELETE FROM symbols_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE doc_id IN ({placeholders}))",
+            f"DELETE FROM symbols_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE doc_id IN ({placeholders}))",  # nosec B608
             params,
         )
         conn.execute(
-            f"DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id IN ({placeholders}))",
+            f"DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id IN ({placeholders}))",  # nosec B608
             params,
         )
-        conn.execute(f"DELETE FROM refs WHERE doc_id IN ({placeholders})", params)
-        conn.execute(f"DELETE FROM chunks WHERE doc_id IN ({placeholders})", params)
-        conn.execute(f"DELETE FROM symbols WHERE doc_id IN ({placeholders})", params)
+        conn.execute(f"DELETE FROM refs WHERE doc_id IN ({placeholders})", params)  # nosec B608
+        conn.execute(f"DELETE FROM chunks WHERE doc_id IN ({placeholders})", params)  # nosec B608
+        conn.execute(f"DELETE FROM symbols WHERE doc_id IN ({placeholders})", params)  # nosec B608
 
     def _delete_doc_payload(self, conn: sqlite3.Connection, doc_id: str) -> None:
-        conn.execute("DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
-        conn.execute("DELETE FROM symbols_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE doc_id=?)", (doc_id,))
-        conn.execute("DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?)",
+            (doc_id,),
+        )
+        conn.execute(
+            "DELETE FROM symbols_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE doc_id=?)",
+            (doc_id,),
+        )
+        conn.execute(
+            "DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?)",
+            (doc_id,),
+        )
         conn.execute("DELETE FROM refs WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM symbols WHERE doc_id=?", (doc_id,))
 
+    def delete_docs(self, doc_ids: Sequence[str]) -> int:
+        unique = list(dict.fromkeys(str(x) for x in doc_ids if x))
+        if not unique:
+            return 0
+        deleted = 0
+        with self.transaction() as conn:
+            for start in range(0, len(unique), 400):
+                part = unique[start : start + 400]
+                placeholders = ",".join("?" for _ in part)
+                existing = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) AS c FROM docs WHERE doc_id IN ({placeholders})",  # nosec B608
+                        part,
+                    ).fetchone()["c"]
+                )
+                if not existing:
+                    continue
+                self._delete_docs_payload(conn, part)
+                conn.execute(f"DELETE FROM docs WHERE doc_id IN ({placeholders})", part)  # nosec B608
+                deleted += existing
+        return deleted
+
     def delete_missing_docs(self, live_doc_ids: set[str]) -> int:
         rows = self.conn.execute("SELECT doc_id FROM docs").fetchall()
-        stale = [r["doc_id"] for r in rows if r["doc_id"] not in live_doc_ids]
-        if not stale:
-            return 0
-        with self.transaction() as conn:
-            for doc_id in stale:
-                self._delete_doc_payload(conn, doc_id)
-                conn.execute("DELETE FROM docs WHERE doc_id=?", (doc_id,))
-        return len(stale)
+        stale = [str(r["doc_id"]) for r in rows if str(r["doc_id"]) not in live_doc_ids]
+        return self.delete_docs(stale)
 
     def all_vectors(self) -> tuple[list[str], np.ndarray]:
         meta = self.conn.execute(
@@ -599,10 +747,12 @@ class Store:
         target_dtype = np.float16 if self.vector_storage_dtype == "float16" else np.float32
         ids: list[str] = []
         matrix = np.empty((n, dim), dtype=target_dtype)
-        cur = self.conn.execute("SELECT chunk_id, dim, dtype, vector FROM vectors ORDER BY chunk_id")
+        cur = self.conn.execute(
+            "SELECT chunk_id, dim, dtype, vector FROM vectors ORDER BY chunk_id"
+        )
         row_idx = 0
         while True:
-            batch = cur.fetchmany(8192)
+            batch = cur.fetchmany(self.vector_load_batch_size)
             if not batch:
                 break
             for row in batch:
@@ -623,11 +773,16 @@ class Store:
         if not chunk_ids:
             return []
         placeholders = ",".join("?" for _ in chunk_ids)
-        rows = self.conn.execute(f"SELECT * FROM chunks WHERE id IN ({placeholders})", tuple(chunk_ids)).fetchall()
+        rows = self.conn.execute(
+            f"SELECT * FROM chunks WHERE id IN ({placeholders})",  # nosec B608
+            tuple(chunk_ids)
+        ).fetchall()
         by_id = {r["id"]: dict(r) for r in rows}
         return [by_id[cid] for cid in chunk_ids if cid in by_id]
 
-    def chunks_for_symbols(self, symbol_ids: Sequence[str], *, limit_per_symbol: int = 1) -> list[dict]:
+    def chunks_for_symbols(
+        self, symbol_ids: Sequence[str], *, limit_per_symbol: int = 1
+    ) -> list[dict]:
         out: list[dict] = []
         for sid in symbol_ids:
             rows = self.conn.execute(
@@ -657,7 +812,9 @@ class Store:
             out.extend(dict(r) for r in rows)
         return out
 
-    def fts_search(self, query: str, limit: int, path_prefix: str | None = None) -> list[tuple[str, float]]:
+    def fts_search(
+        self, query: str, limit: int, path_prefix: str | None = None
+    ) -> list[tuple[str, float]]:
         sql = """
           SELECT chunk_id, bm25(chunks_fts, 1.4, 1.2, 1.8, 1.0) AS rank
           FROM chunks_fts
@@ -675,14 +832,19 @@ class Store:
             return []
         return [(str(r["chunk_id"]), float(-r["rank"])) for r in rows]
 
-    def symbol_search(self, query: str, limit: int, path_prefix: str | None = None, kind: str | None = None) -> list[dict]:
+    def symbol_search(
+        self, query: str, limit: int, path_prefix: str | None = None, kind: str | None = None
+    ) -> list[dict]:
         q = query.strip()
         if not q:
             return []
         by_id: dict[str, dict] = {}
 
-        exact_sql = "SELECT *, 100.0 AS score, 'exact' AS match_type FROM symbols WHERE (lower(name)=? OR lower(qualified_name)=?)"
-        params: list[object] = [q.lower(), q.lower()]
+        exact_sql = (
+            "SELECT *, 100.0 AS score, 'exact' AS match_type FROM symbols "
+            "WHERE (name=? COLLATE NOCASE OR qualified_name=? COLLATE NOCASE)"
+        )
+        params: list[object] = [q, q]
         if path_prefix:
             exact_sql += " AND path LIKE ?"
             params.append(f"{path_prefix}%")
@@ -748,7 +910,9 @@ class Store:
         except sqlite3.OperationalError:
             pass
         out = list(by_id.values())
-        out.sort(key=lambda d: (float(d.get("score", 0)), -int(d.get("line_start", 0))), reverse=True)
+        out.sort(
+            key=lambda d: (float(d.get("score", 0)), -int(d.get("line_start", 0))), reverse=True
+        )
         return out[:limit]
 
     def path_search(self, query: str, limit: int, path_prefix: str | None = None) -> list[dict]:
@@ -760,7 +924,7 @@ class Store:
         for term in terms[:5]:
             clauses.append("lower(path) LIKE ?")
             params.append(f"%{term.lower()}%")
-        sql = "SELECT *, 1.0 AS score FROM docs WHERE " + " AND ".join(clauses)
+        sql = "SELECT *, 1.0 AS score FROM docs WHERE " + " AND ".join(clauses)  # nosec B608
         if path_prefix:
             sql += " AND path LIKE ?"
             params.append(f"{path_prefix}%")
@@ -780,17 +944,23 @@ class Store:
         if not symbol_ids:
             return []
         placeholders = ",".join("?" for _ in symbol_ids)
-        rows = self.conn.execute(f"SELECT * FROM symbols WHERE id IN ({placeholders})", tuple(symbol_ids)).fetchall()
+        rows = self.conn.execute(
+            f"SELECT * FROM symbols WHERE id IN ({placeholders})",  # nosec B608
+            tuple(symbol_ids)
+        ).fetchall()
         by_id = {r["id"]: dict(r) for r in rows}
         return [by_id[sid] for sid in symbol_ids if sid in by_id]
 
     def symbols_in_doc(self, doc_id: str, *, limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT * FROM symbols WHERE doc_id=? ORDER BY line_start, line_end LIMIT ?", (doc_id, limit)
+            "SELECT * FROM symbols WHERE doc_id=? ORDER BY line_start, line_end LIMIT ?",
+            (doc_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def find_references(self, target_name: str, limit: int, path_prefix: str | None = None) -> list[dict]:
+    def find_references(
+        self, target_name: str, limit: int, path_prefix: str | None = None
+    ) -> list[dict]:
         q = target_name.strip().split(".")[-1].lower()
         if not q:
             return []
@@ -820,43 +990,62 @@ class Store:
         if path_prefix:
             where = "WHERE path LIKE ?"
             params.append(f"{path_prefix}%")
-        docs = [dict(r) for r in self.conn.execute(
-            f"SELECT doc_id, path, title, size_bytes FROM docs {where} ORDER BY path LIMIT ?", [*params, limit]
-        ).fetchall()]
-        symbols = [dict(r) for r in self.conn.execute(
-            f"""
-            SELECT id, doc_id, path, language, kind, name, qualified_name, line_start, line_end
-            FROM symbols {where}
-            ORDER BY path, line_start LIMIT ?
-            """,
-            [*params, limit * 3],
-        ).fetchall()]
-        languages = [dict(r) for r in self.conn.execute(
-            f"SELECT language, COUNT(*) AS symbols FROM symbols {where} GROUP BY language ORDER BY symbols DESC",
-            params,
-        ).fetchall()]
+        docs_sql = (
+            "SELECT doc_id, path, title, size_bytes FROM docs "  # nosec B608
+            + where
+            + " ORDER BY path LIMIT ?"
+        )
+        symbols_sql = (
+            "SELECT id, doc_id, path, language, kind, name, qualified_name, "  # nosec B608
+            "line_start, line_end FROM symbols "
+            + where
+            + " ORDER BY path, line_start LIMIT ?"
+        )
+        languages_sql = (
+            "SELECT language, COUNT(*) AS symbols FROM symbols "  # nosec B608
+            + where
+            + " GROUP BY language ORDER BY symbols DESC"
+        )
+        docs = [
+            dict(r)
+            for r in self.conn.execute(docs_sql, [*params, limit]).fetchall()
+        ]
+        symbols = [
+            dict(r)
+            for r in self.conn.execute(symbols_sql, [*params, limit * 3]).fetchall()
+        ]
+        languages = [
+            dict(r) for r in self.conn.execute(languages_sql, params).fetchall()
+        ]
         by_doc: dict[str, list[dict]] = {}
         for sym in symbols:
             by_doc.setdefault(sym["doc_id"], []).append(sym)
         files = []
         for doc in docs:
             syms = by_doc.get(doc["doc_id"], [])[:25]
-            files.append({
-                "path": doc["path"],
-                "size_bytes": doc["size_bytes"],
-                "symbols": [
-                    {
-                        "id": s["id"],
-                        "kind": s["kind"],
-                        "name": s["name"],
-                        "qualified_name": s["qualified_name"],
-                        "line_start": s["line_start"],
-                        "line_end": s["line_end"],
-                    }
-                    for s in syms
-                ],
-            })
-        return {"files": files, "languages": languages, "file_count": len(docs), "symbol_count_sampled": len(symbols)}
+            files.append(
+                {
+                    "path": doc["path"],
+                    "size_bytes": doc["size_bytes"],
+                    "symbols": [
+                        {
+                            "id": s["id"],
+                            "kind": s["kind"],
+                            "name": s["name"],
+                            "qualified_name": s["qualified_name"],
+                            "line_start": s["line_start"],
+                            "line_end": s["line_end"],
+                        }
+                        for s in syms
+                    ],
+                }
+            )
+        return {
+            "files": files,
+            "languages": languages,
+            "file_count": len(docs),
+            "symbol_count_sampled": len(symbols),
+        }
 
     def _fts_query(self, query: str) -> str:
         terms = []
@@ -885,14 +1074,30 @@ class Store:
         symbols = self.conn.execute("SELECT COUNT(*) AS c FROM symbols").fetchone()["c"]
         refs = self.conn.execute("SELECT COUNT(*) AS c FROM refs").fetchone()["c"]
         vecs = self.conn.execute("SELECT COUNT(*) AS c FROM vectors").fetchone()["c"]
+        try:
+            db_bytes = self.path.stat().st_size
+        except OSError:
+            db_bytes = 0
         return {
             "db": self.path.as_posix(),
+            "db_bytes": int(db_bytes),
+            "schema_version": int(self.get_meta("schema_version", "0") or 0),
+            "index_state": self.get_meta("index_state", "unknown"),
+            "index_fingerprint": self.get_meta("index_fingerprint", ""),
             "docs": int(docs),
             "chunks": int(chunks),
             "symbols": int(symbols),
             "references": int(refs),
             "vectors": int(vecs),
             "corpus_version": self.corpus_version(),
+        }
+
+    def integrity_check(self) -> dict:
+        quick = self.conn.execute("PRAGMA quick_check").fetchone()
+        fk = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+        return {
+            "quick_check": str(quick[0] if quick else "unknown"),
+            "foreign_key_violations": len(fk),
         }
 
 
@@ -913,14 +1118,10 @@ def replace_index_database(source_db_dir: Path, target_db_dir: Path) -> None:
         raise FileNotFoundError(f"staging database not found: {source}")
 
     for suffix in ("-wal", "-shm"):
-        try:
+        with suppress(FileNotFoundError):
             Path(str(target) + suffix).unlink()
-        except FileNotFoundError:
-            pass
-    try:
+    with suppress(FileNotFoundError):
         backup.unlink()
-    except FileNotFoundError:
-        pass
 
     had_target = target.exists()
     if had_target:
@@ -932,8 +1133,6 @@ def replace_index_database(source_db_dir: Path, target_db_dir: Path) -> None:
             os.replace(backup, target)
         raise
     else:
-        try:
+        with suppress(FileNotFoundError):
             backup.unlink()
-        except FileNotFoundError:
-            pass
         shutil.rmtree(source_dir, ignore_errors=True)

@@ -2,16 +2,23 @@
   "mcpServers": {
     "blazing-code-rag": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["--directory", "/ABS/PATH/TO/blazing-rag-mcp", "run", "brag-mcp"],
+      "command": "/ABSOLUTE/PATH/TO/blazing-rag-mcp-production/.venv/bin/brag-mcp",
+      "args": [],
       "env": {
-        "BRAG_ROOTS": "${CLAUDE_PROJECT_DIR:-.}",
-        "BRAG_DB_DIR": "${CLAUDE_PROJECT_DIR:-.}/.brag",
+        "BRAG_ROOTS": "/ABSOLUTE/PATH/TO/REPOSITORY",
+        "BRAG_DB_DIR": "/ABSOLUTE/PATH/TO/REPOSITORY/.brag",
+
+        "HF_HOME": "/ABSOLUTE/PATH/TO/MODEL-CACHE/huggingface",
+        "SENTENCE_TRANSFORMERS_HOME": "/ABSOLUTE/PATH/TO/MODEL-CACHE/sentence-transformers",
+        "BRAG_EMBEDDING_CACHE_DIR": "/ABSOLUTE/PATH/TO/MODEL-CACHE/sentence-transformers",
         "BRAG_DEVICE": "auto",
-        "BRAG_FAISS_GPU": "true",
         "BRAG_VECTOR_BACKEND": "auto",
-        "BRAG_TORCH_VECTOR_DEVICE": "auto",
-        "BRAG_EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-0.6B",
+        "BRAG_EMBEDDING_MODEL": "nomic-ai/CodeRankEmbed",
+        "BRAG_EMBEDDING_REVISION": "3c4b60807d71f79b43f3c4363786d9493691f8b1",
+        "BRAG_EMBEDDING_LOCAL_FILES_ONLY": "true",
+        "BRAG_EMBEDDING_TRUST_REMOTE_CODE": "true",
+        "BRAG_EMBEDDING_ALLOW_HASH_FALLBACK": "false",
+        "BRAG_READ_ONLY": "true",
         "BRAG_ALLOW_REINDEX_TOOL": "false"
       }
     }

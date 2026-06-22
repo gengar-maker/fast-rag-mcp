@@ -2,19 +2,59 @@ from __future__ import annotations
 
 import hashlib
 import os
-import subprocess
+import shutil
+import subprocess  # nosec B404
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Iterator
 
 from .config import Settings
 from .types import Document
 
+GIT_EXECUTABLE = shutil.which("git")
+
+
 TEXT_EXTENSIONS = {
-    ".md", ".mdx", ".txt", ".rst", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs",
-    ".java", ".kt", ".kts", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".json", ".yaml", ".yml",
-    ".toml", ".sql", ".sh", ".bash", ".zsh", ".dockerfile", ".env", ".ini", ".cfg",
+    ".md",
+    ".mdx",
+    ".txt",
+    ".rst",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".kts",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hpp",
+    ".hh",
+    ".cs",
+    ".rb",
+    ".php",
+    ".swift",
+    ".scala",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".sql",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".dockerfile",
+    ".ini",
+    ".cfg",
 }
 
 
@@ -28,12 +68,17 @@ class ScanStats:
     files_skipped_size: int = 0
     files_skipped_pattern: int = 0
     errors: int = 0
+    truncated: bool = False
     largest_files: list[tuple[int, str]] = field(default_factory=list)
 
     def add_largest(self, size: int, path: Path) -> None:
         self.largest_files.append((size, path.as_posix()))
-        self.largest_files.sort(key=lambda x: x[0], reverse=True)
+        self.largest_files.sort(key=lambda item: item[0], reverse=True)
         del self.largest_files[20:]
+
+    @property
+    def complete(self) -> bool:
+        return not self.truncated and self.errors == 0
 
     def as_dict(self) -> dict:
         return {
@@ -45,8 +90,17 @@ class ScanStats:
             "files_skipped_size": self.files_skipped_size,
             "files_skipped_pattern": self.files_skipped_pattern,
             "errors": self.errors,
-            "largest_files": [{"bytes": n, "path": p} for n, p in self.largest_files],
+            "truncated": self.truncated,
+            "complete": self.complete,
+            "largest_files": [{"bytes": size, "path": path} for size, path in self.largest_files],
         }
+
+
+@dataclass(slots=True)
+class RequestedPaths:
+    existing: list[tuple[Path, Path]] = field(default_factory=list)
+    missing: list[tuple[Path, Path]] = field(default_factory=list)
+    rejected: list[str] = field(default_factory=list)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -54,12 +108,17 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def stable_id(*parts: str, n: int = 20) -> str:
-    h = hashlib.blake2b("\x1f".join(parts).encode("utf-8", "ignore"), digest_size=16).hexdigest()
-    return h[:n]
+    digest = hashlib.blake2b(
+        "\x1f".join(parts).encode("utf-8", "ignore"), digest_size=16
+    ).hexdigest()
+    return digest[:n]
 
 
 def document_id(root: Path, path: Path) -> str:
-    return stable_id(root.resolve().as_posix(), path.resolve().relative_to(root.resolve()).as_posix())
+    root_resolved = root.resolve()
+    path_resolved = path.resolve(strict=False)
+    relative = path_resolved.relative_to(root_resolved).as_posix()
+    return stable_id(root_resolved.as_posix(), relative)
 
 
 def is_binary_sample(data: bytes) -> bool:
@@ -67,55 +126,78 @@ def is_binary_sample(data: bytes) -> bool:
         return True
     if not data:
         return False
-    non_text = sum(1 for b in data[:4096] if b < 9 or (13 < b < 32))
-    return non_text / max(1, min(len(data), 4096)) > 0.08
+    sample = data[:4096]
+    non_text = sum(1 for byte in sample if byte < 9 or 13 < byte < 32)
+    return non_text / max(1, len(sample)) > 0.08
 
 
 def _matches_any(name: str, patterns: set[str]) -> bool:
-    return name in patterns or any(("*" in pat or "?" in pat or "[" in pat) and fnmatch(name, pat) for pat in patterns)
+    return name in patterns or any(
+        ("*" in pattern or "?" in pattern or "[" in pattern) and fnmatch(name, pattern)
+        for pattern in patterns
+    )
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def should_skip_dir(path: Path, settings: Settings) -> bool:
     db_dir = settings.resolved_db_dir()
-    try:
-        path.resolve().relative_to(db_dir)
+    if _is_within(path, db_dir):
         return True
-    except Exception:
-        pass
     name = path.name
     if _matches_any(name, settings.exclude_dirs):
         return True
-    if settings.exclude_hidden_dirs and name.startswith(".") and name not in settings.include_hidden_dir_names:
-        return True
-    return False
+    return bool(
+        settings.exclude_hidden_dirs
+        and name.startswith(".")
+        and name not in settings.include_hidden_dir_names
+    )
 
 
-def matches_include(rel_path: str, settings: Settings) -> bool:
-    return any(fnmatch(rel_path, pat) for pat in settings.include_globs)
+def matches_include(relative_path: str, settings: Settings) -> bool:
+    return any(fnmatch(relative_path, pattern) for pattern in settings.include_globs)
 
 
 def _accept_file(root: Path, path: Path, settings: Settings, stats: ScanStats | None) -> bool:
     if stats is not None:
         stats.files_seen += 1
     try:
-        rel = path.relative_to(root).as_posix()
-        if any(_matches_any(part, settings.exclude_dirs) for part in Path(rel).parts[:-1]):
+        if not _is_within(path, root):
             if stats is not None:
                 stats.files_skipped_pattern += 1
             return False
-        st = path.stat()
-        if not path.is_file() or st.st_size > settings.max_file_bytes:
-            if stats is not None and st.st_size > settings.max_file_bytes:
-                stats.files_skipped_size += 1
-                stats.add_largest(st.st_size, path)
+        relative = path.resolve(strict=False).relative_to(root.resolve()).as_posix()
+        if any(
+            fnmatch(path.name, pattern) or fnmatch(relative, pattern)
+            for pattern in settings.exclude_file_globs
+        ):
+            if stats is not None:
+                stats.files_skipped_pattern += 1
             return False
-        if not matches_include(rel, settings) and path.suffix.lower() not in TEXT_EXTENSIONS:
+        parts = Path(relative).parts
+        if any(_matches_any(part, settings.exclude_dirs) for part in parts[:-1]):
+            if stats is not None:
+                stats.files_skipped_pattern += 1
+            return False
+        stat = path.stat()
+        if not path.is_file() or stat.st_size > settings.max_file_bytes:
+            if stats is not None and stat.st_size > settings.max_file_bytes:
+                stats.files_skipped_size += 1
+                stats.add_largest(stat.st_size, path)
+            return False
+        if not matches_include(relative, settings) and path.suffix.lower() not in TEXT_EXTENSIONS:
             if stats is not None:
                 stats.files_skipped_pattern += 1
             return False
         if stats is not None:
             stats.files_yielded += 1
-            stats.add_largest(st.st_size, path)
+            stats.add_largest(stat.st_size, path)
         return True
     except OSError:
         if stats is not None:
@@ -123,48 +205,90 @@ def _accept_file(root: Path, path: Path, settings: Settings, stats: ScanStats | 
         return False
 
 
+def _iter_null_delimited(stream) -> Iterator[bytes]:
+    buffer = b""
+    while True:
+        chunk = stream.read(65_536)
+        if not chunk:
+            break
+        buffer += chunk
+        parts = buffer.split(b"\0")
+        buffer = parts.pop()
+        yield from (part for part in parts if part)
+    if buffer:
+        yield buffer
+
+
 def _git_paths(root: Path) -> Iterator[Path]:
-    proc = subprocess.run(
-        ["git", "-C", root.as_posix(), "ls-files", "-co", "--exclude-standard", "-z"],
+    if not GIT_EXECUTABLE:
+        raise FileNotFoundError("git executable was not found")
+    process = subprocess.Popen(  # nosec B603
+        [GIT_EXECUTABLE, "-C", root.as_posix(), "ls-files", "-co", "--exclude-standard", "-z"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        check=True,
-        timeout=30,
     )
-    for raw in proc.stdout.split(b"\0"):
-        if not raw:
-            continue
-        rel = raw.decode("utf-8", "surrogateescape")
-        yield root / rel
+    if process.stdout is None:
+        process.kill()
+        raise RuntimeError("failed to capture git ls-files output")
+    try:
+        for raw in _iter_null_delimited(process.stdout):
+            relative = raw.decode("utf-8", "surrogateescape")
+            yield root / relative
+    finally:
+        process.stdout.close()
+        try:
+            return_code = process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            raise
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, process.args)
 
 
 def _can_use_git(root: Path) -> bool:
+    if not GIT_EXECUTABLE:
+        return False
     try:
-        proc = subprocess.run(
-            ["git", "-C", root.as_posix(), "rev-parse", "--is-inside-work-tree"],
+        process = subprocess.run(  # nosec B603
+            [GIT_EXECUTABLE, "-C", root.as_posix(), "rev-parse", "--is-inside-work-tree"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,
             timeout=5,
             text=True,
         )
-        return proc.returncode == 0 and proc.stdout.strip() == "true"
+        return process.returncode == 0 and process.stdout.strip() == "true"
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _walk_root(root: Path, settings: Settings, stats: ScanStats | None) -> Iterator[Path]:
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        directory = Path(dirpath)
+        kept: list[str] = []
+        for dirname in dirnames:
+            child = directory / dirname
+            if should_skip_dir(child, settings):
+                if stats is not None:
+                    stats.dirs_skipped += 1
+                continue
+            kept.append(dirname)
+        dirnames[:] = kept
+        if should_skip_dir(directory, settings):
+            continue
+        for name in sorted(filenames):
+            yield directory / name
 
 
 def iter_candidate_files_with_roots(
     settings: Settings,
     stats: ScanStats | None = None,
 ) -> Iterator[tuple[Path, Path]]:
-    """Yield ``(root, path)`` pairs without materializing the repository.
-
-    Git repositories use ``git ls-files -co --exclude-standard`` by default. This is much faster
-    than a recursive Python walk for large repositories and automatically respects .gitignore.
-    """
+    """Yield candidate ``(root, path)`` pairs without materializing the repository."""
     roots = settings.resolved_roots()
     if stats is not None:
-        stats.roots = [p.as_posix() for p in roots]
+        stats.roots = [path.as_posix() for path in roots]
     yielded = 0
     seen: set[str] = set()
 
@@ -173,13 +297,14 @@ def iter_candidate_files_with_roots(
         use_git = settings.scan_backend == "git" or (
             settings.scan_backend == "auto" and _can_use_git(root)
         )
+        iterator: Iterator[Path]
         if use_git:
             try:
                 iterator = _git_paths(root)
                 if stats is not None:
                     stats.backends[root.as_posix()] = "git"
                 for path in iterator:
-                    key = path.resolve().as_posix()
+                    key = path.absolute().as_posix()
                     if key in seen:
                         continue
                     seen.add(key)
@@ -187,6 +312,8 @@ def iter_candidate_files_with_roots(
                         yield root, path
                         yielded += 1
                         if yielded >= settings.max_files:
+                            if stats is not None:
+                                stats.truncated = True
                             return
                 continue
             except (OSError, subprocess.SubprocessError):
@@ -195,35 +322,77 @@ def iter_candidate_files_with_roots(
 
         if stats is not None:
             stats.backends[root.as_posix()] = "walk"
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dpath = Path(dirpath)
-            kept_dirs: list[str] = []
-            for dirname in dirnames:
-                child = dpath / dirname
-                if should_skip_dir(child, settings):
-                    if stats is not None:
-                        stats.dirs_skipped += 1
-                    continue
-                kept_dirs.append(dirname)
-            dirnames[:] = kept_dirs
-            if should_skip_dir(dpath, settings):
+        for path in _walk_root(root, settings, stats):
+            key = path.absolute().as_posix()
+            if key in seen:
                 continue
-            for name in sorted(filenames):
-                path = dpath / name
-                key = path.resolve().as_posix()
-                if key in seen:
-                    continue
-                seen.add(key)
-                if _accept_file(root, path, settings, stats):
-                    yield root, path
-                    yielded += 1
-                    if yielded >= settings.max_files:
-                        return
+            seen.add(key)
+            if _accept_file(root, path, settings, stats):
+                yield root, path
+                yielded += 1
+                if yielded >= settings.max_files:
+                    if stats is not None:
+                        stats.truncated = True
+                    return
 
 
 def iter_candidate_files(settings: Settings, stats: ScanStats | None = None) -> Iterator[Path]:
     for _, path in iter_candidate_files_with_roots(settings, stats):
         yield path
+
+
+def resolve_requested_paths(settings: Settings, requested: Sequence[str]) -> RequestedPaths:
+    """Resolve user-provided files/directories under configured roots.
+
+    Missing files are retained so their existing index records can be removed. Paths outside all
+    configured roots are rejected. Directories are expanded using the same include/exclude policy.
+    """
+    if len(requested) > settings.max_targeted_paths:
+        raise ValueError(
+            f"too many targeted paths: {len(requested)} > {settings.max_targeted_paths}"
+        )
+    roots = settings.resolved_roots()
+    result = RequestedPaths()
+    seen: set[str] = set()
+
+    for raw in requested:
+        raw_path = Path(raw).expanduser()
+        candidates = [raw_path] if raw_path.is_absolute() else [root / raw_path for root in roots]
+        chosen: tuple[Path, Path] | None = None
+        for candidate in candidates:
+            for root in roots:
+                if _is_within(candidate, root):
+                    chosen = (root.resolve(), candidate.resolve(strict=False))
+                    if candidate.exists():
+                        break
+            if chosen is not None and candidate.exists():
+                break
+        if chosen is None:
+            result.rejected.append(raw)
+            continue
+        root, path = chosen
+        key = f"{root}\x1f{path}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if not path.exists():
+            result.missing.append((root, path))
+            continue
+        if path.is_dir():
+            for child in _walk_root(path, settings, None):
+                child_key = f"{root}\x1f{child.absolute()}"
+                if child_key in seen:
+                    continue
+                seen.add(child_key)
+                if _accept_file(root, child, settings, None):
+                    result.existing.append((root, child))
+            continue
+        if _accept_file(root, path, settings, None):
+            result.existing.append((root, path))
+        else:
+            result.rejected.append(raw)
+    return result
 
 
 def read_document(root: Path, path: Path, settings: Settings) -> Document | None:
@@ -242,12 +411,12 @@ def read_document(root: Path, path: Path, settings: Settings) -> Document | None
         text = data.decode("utf-8", errors="replace")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     content_hash = sha256_bytes(data)
-    rel_path = path.relative_to(root).as_posix()
+    relative_path = path.resolve(strict=False).relative_to(root.resolve()).as_posix()
     return Document(
         doc_id=document_id(root, path),
         root=root,
         path=path,
-        rel_path=rel_path,
+        rel_path=relative_path,
         title=path.name,
         text=text,
         content_hash=content_hash,

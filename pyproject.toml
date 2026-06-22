@@ -4,51 +4,64 @@ build-backend = "hatchling.build"
 
 [project]
 name = "blazing-rag-mcp"
-version = "0.5.0"
-description = "Ultra-fast local code-intelligence RAG MCP server with CUDA, Metal/MPS, and CPU vector acceleration"
+version = "1.0.1"
+description = "Production local code-intelligence RAG MCP server with lazy MPS/CUDA acceleration"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Konstantin" }]
 dependencies = [
-  "mcp[cli]>=1.12.0",
-  "numpy>=1.26",
-  "pydantic>=2.7",
-  "pydantic-settings>=2.3",
-  "orjson>=3.10",
-  "cachetools>=5.3",
-  "typing-extensions>=4.12",
+  "mcp[cli]>=1.12.0,<2",
+  "numpy>=1.26,<3",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+  "orjson>=3.10,<4",
+  "cachetools>=5.3,<8",
+  "typing-extensions>=4.12,<5",
 ]
 
 [project.optional-dependencies]
 embeddings = [
-  "torch>=2.3",
-  "sentence-transformers>=3.0",
+  "torch>=2.3,<3",
+  "sentence-transformers==3.4.1",
+  "transformers==4.45.1",
+  "huggingface-hub>=0.24,<1",
+  "einops>=0.8,<1",
 ]
-faiss-cpu = ["faiss-cpu>=1.8"]
+faiss-cpu = ["faiss-cpu>=1.8,<2"]
 code = [
-  "tree-sitter>=0.22",
-  "tree-sitter-language-pack>=0.7.2",
+  "tree-sitter>=0.22,<0.26",
+  "tree-sitter-language-pack==0.7.2",
 ]
 gpu = [
-  "torch>=2.3",
-  "sentence-transformers>=3.0",
+  "torch>=2.3,<3",
+  "sentence-transformers==3.4.1",
+  "transformers==4.45.1",
+  "huggingface-hub>=0.24,<1",
+  "einops>=0.8,<1",
 ]
 mac-metal = [
-  "torch>=2.3",
-  "sentence-transformers>=3.0",
+  "torch>=2.3,<3",
+  "sentence-transformers==3.4.1",
+  "transformers==4.45.1",
+  "huggingface-hub>=0.24,<1",
+  "einops>=0.8,<1",
 ]
 all = [
-  "torch>=2.3",
-  "sentence-transformers>=3.0",
-  "faiss-cpu>=1.8",
-  "tree-sitter>=0.22",
-  "tree-sitter-language-pack>=0.7.2",
+  "torch>=2.3,<3",
+  "sentence-transformers==3.4.1",
+  "transformers==4.45.1",
+  "huggingface-hub>=0.24,<1",
+  "einops>=0.8,<1",
+  "faiss-cpu>=1.8,<2",
+  "tree-sitter>=0.22,<0.26",
+  "tree-sitter-language-pack==0.7.2",
 ]
 dev = [
   "pytest>=8.0",
   "ruff>=0.5",
   "mypy>=1.10",
+  "bandit>=1.7",
 ]
 
 [project.scripts]
@@ -61,9 +74,11 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = false
+ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

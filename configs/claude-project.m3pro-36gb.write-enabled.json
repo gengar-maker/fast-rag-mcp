@@ -11,7 +11,6 @@
         "HF_HOME": "/ABSOLUTE/PATH/TO/MODEL-CACHE/huggingface",
         "SENTENCE_TRANSFORMERS_HOME": "/ABSOLUTE/PATH/TO/MODEL-CACHE/sentence-transformers",
         "BRAG_EMBEDDING_CACHE_DIR": "/ABSOLUTE/PATH/TO/MODEL-CACHE/sentence-transformers",
-
         "BRAG_DEVICE": "mps",
         "BRAG_EMBEDDING_MODEL": "nomic-ai/CodeRankEmbed",
         "BRAG_EMBEDDING_REVISION": "3c4b60807d71f79b43f3c4363786d9493691f8b1",
@@ -22,23 +21,13 @@
         "BRAG_EMBEDDING_BATCH_SIZE": "32",
         "BRAG_EMBEDDING_FLUSH_CHUNKS": "1024",
         "BRAG_EMBEDDING_MAX_SEQ_LENGTH": "384",
-        "BRAG_EMBEDDING_EMPTY_CACHE_AFTER_ENCODE": "false",
         "BRAG_EMBEDDING_REUSE_UNCHANGED_CHUNKS": "true",
         "BRAG_MPS_ENABLE_FALLBACK": "false",
-
-        "BRAG_TOKENIZER_PARALLELISM": "true",
         "BRAG_TOKENIZER_THREADS": "8",
         "TOKENIZERS_PARALLELISM": "true",
         "RAYON_NUM_THREADS": "8",
-        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-
         "BRAG_SCAN_BACKEND": "auto",
         "BRAG_FAST_STAT_SKIP": "true",
-        "BRAG_DELETE_MISSING_ON_INCOMPLETE_SCAN": "false",
-        "BRAG_CHUNK_TOKENS": "384",
-        "BRAG_CHUNK_OVERLAP": "32",
-        "BRAG_ADD_FILE_SUMMARY_CHUNKS": "false",
-
         "BRAG_VECTOR_BACKEND": "auto",
         "BRAG_VECTOR_STORAGE_DTYPE": "float16",
         "BRAG_TORCH_VECTOR_DEVICE": "mps",
@@ -46,9 +35,8 @@
         "BRAG_MPS_VECTOR_MIN_VECTORS": "30000",
         "BRAG_FAISS_GPU": "false",
         "BRAG_KEEP_CPU_VECTOR_COPY": "false",
-
-        "BRAG_READ_ONLY": "true",
-        "BRAG_ALLOW_REINDEX_TOOL": "false",
+        "BRAG_READ_ONLY": "false",
+        "BRAG_ALLOW_REINDEX_TOOL": "true",
         "BRAG_LOG_LEVEL": "INFO"
       }
     }

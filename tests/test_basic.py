@@ -75,7 +75,13 @@ def validate_token(token: str) -> str:
 """.strip(),
         encoding="utf-8",
     )
-    settings = Settings(roots=[repo.as_posix()], db_dir=db, min_chunk_chars=10, vector_backend="numpy")
+    settings = Settings(
+        roots=[repo.as_posix()],
+        db_dir=db,
+        min_chunk_chars=10,
+        vector_backend="numpy",
+        embedding_allow_hash_fallback=True,
+    )
     store = Store(db)
     embeddings = EmbeddingModel(settings)
     indexer = Indexer(settings, store, embeddings)
@@ -142,16 +148,24 @@ def test_cross_file_embedding_batching(tmp_path):
 def test_incremental_reuses_unchanged_chunk_embeddings(tmp_path):
     import hashlib
     import os
+
     import numpy as np
 
     class FakeEmbeddings:
         def __init__(self):
             from blazing_rag_mcp.embeddings import EmbeddingInfo
+
             self.calls = 0
             self.texts = 0
             self.info = EmbeddingInfo(
-                model="fake", device="cpu", dim=8, normalized=True,
-                provider="fake", max_seq_length=64, precision="float32", batch_size=32,
+                model="fake",
+                device="cpu",
+                dim=8,
+                normalized=True,
+                provider="fake",
+                max_seq_length=64,
+                precision="float32",
+                batch_size=32,
             )
 
         def embedding_hash(self, text):
@@ -178,9 +192,13 @@ def test_incremental_reuses_unchanged_chunk_embeddings(tmp_path):
         encoding="utf-8",
     )
     settings = Settings(
-        roots=[repo.as_posix()], db_dir=db, min_chunk_chars=10,
-        embedding_flush_chunks=128, vector_backend="numpy",
-        vector_storage_dtype="float16", scan_backend="walk",
+        roots=[repo.as_posix()],
+        db_dir=db,
+        min_chunk_chars=10,
+        embedding_flush_chunks=128,
+        vector_backend="numpy",
+        vector_storage_dtype="float16",
+        scan_backend="walk",
     )
     store = Store(db, vector_storage_dtype="float16")
     embeddings = FakeEmbeddings()
@@ -207,3 +225,25 @@ def test_incremental_reuses_unchanged_chunk_embeddings(tmp_path):
     ids, matrix = store.all_vectors()
     assert ids
     assert matrix.dtype == np.float16
+
+
+def test_member_calls_are_indexed_as_references(tmp_path):
+    from blazing_rag_mcp.code_index import extract_references, extract_symbols
+    from blazing_rag_mcp.io import read_document
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = repo / "service.py"
+    path.write_text(
+        "class Service:\n"
+        "    def run(self):\n"
+        "        self.validate()\n"
+        "        client.fetch()\n",
+        encoding="utf-8",
+    )
+    settings = Settings(roots=[repo.as_posix()], db_dir=tmp_path / "db")
+    document = read_document(repo, path, settings)
+    assert document is not None
+    refs = extract_references(document, extract_symbols(document))
+    names = {ref.target_name for ref in refs}
+    assert {"validate", "fetch"} <= names

@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export BRAG_ROOTS="${BRAG_ROOTS:-$PWD}"
-export BRAG_DB_DIR="${BRAG_DB_DIR:-$PWD/.brag}"
-uv run brag index
-uv run brag status
-uv run brag search "where is the main server implemented" --top-k 5
-uv run brag symbol main --limit 5
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="${1:-$ROOT_DIR}"
+DB_DIR="$(mktemp -d -t brag-smoke.XXXXXX)"
+trap 'rm -rf "$DB_DIR"' EXIT
+
+export BRAG_ROOTS="$REPO_DIR"
+export BRAG_DB_DIR="$DB_DIR"
+export BRAG_DEVICE=cpu
+export BRAG_VECTOR_BACKEND=numpy
+export BRAG_EMBEDDING_ALLOW_HASH_FALLBACK=true
+export BRAG_EMBEDDING_MODEL=__smoke_hash_fallback__
+export BRAG_READ_ONLY=true
+
+"$ROOT_DIR/.venv/bin/brag" scan
+"$ROOT_DIR/.venv/bin/brag" index --force
+"$ROOT_DIR/.venv/bin/brag" doctor
+"$ROOT_DIR/.venv/bin/brag" search "Application reindex" --top-k 3

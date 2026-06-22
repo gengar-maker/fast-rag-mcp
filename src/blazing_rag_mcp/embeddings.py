@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
+from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Iterable
+from importlib import metadata
 
 import numpy as np
 from cachetools import LRUCache
@@ -13,7 +16,24 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+def _package_version(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def embedding_environment() -> dict[str, str]:
+    return {
+        "python": sys.version.split()[0],
+        "torch": _package_version("torch"),
+        "sentence_transformers": _package_version("sentence-transformers"),
+        "transformers": _package_version("transformers"),
+        "huggingface_hub": _package_version("huggingface-hub"),
+        "einops": _package_version("einops"),
+        "HF_HOME": os.environ.get("HF_HOME", ""),
+        "SENTENCE_TRANSFORMERS_HOME": os.environ.get("SENTENCE_TRANSFORMERS_HOME", ""),
+    }
 
 
 def resolve_device(device: str) -> str:
@@ -26,8 +46,8 @@ def resolve_device(device: str) -> str:
             return "cuda"
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "mps"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("torch device detection failed: %s", exc)
     return "cpu"
 
 
@@ -48,6 +68,8 @@ class EmbeddingModel:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        if settings.mps_enable_fallback:
+            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         self.device = resolve_device(settings.device)
         self._model = None
         self._provider = "hash-fallback"
@@ -84,28 +106,55 @@ class EmbeddingModel:
             kwargs = {}
             if dtype is not None:
                 kwargs["model_kwargs"] = {"torch_dtype": dtype}
-            self._model = SentenceTransformer(
+            cache_folder = None
+            if self.settings.embedding_cache_dir is not None:
+                cache_path = self.settings.embedding_cache_dir.expanduser().resolve()
+                if self.settings.embedding_local_files_only and not cache_path.exists():
+                    raise FileNotFoundError(
+                        f"embedding cache directory does not exist: {cache_path}"
+                    )
+                cache_path.mkdir(parents=True, exist_ok=True)
+                cache_folder = str(cache_path)
+
+            installed_transformers = _package_version("transformers")
+            if (
+                self.settings.embedding_model.lower().endswith("coderankembed")
+                and installed_transformers != "not-installed"
+                and int(installed_transformers.split(".", 1)[0]) >= 5
+            ):
+                raise RuntimeError(
+                    "CodeRankEmbed custom model code requires Transformers 4.x; "
+                    f"installed transformers={installed_transformers}"
+                )
+
+            model = SentenceTransformer(
                 self.settings.embedding_model,
+                revision=self.settings.embedding_revision or None,
                 device=self.device,
                 trust_remote_code=self.settings.embedding_trust_remote_code,
+                local_files_only=self.settings.embedding_local_files_only,
+                cache_folder=cache_folder,
                 **kwargs,
             )
+            self._model = model
             try:
-                current = int(getattr(self._model, "max_seq_length", self._max_seq_length) or self._max_seq_length)
-                self._model.max_seq_length = min(current, self._max_seq_length)
-            except Exception:
-                pass
-            try:
-                self._model.eval()
-            except Exception:
-                pass
-            dim = self._model.get_sentence_embedding_dimension()
+                current = int(
+                    getattr(model, "max_seq_length", self._max_seq_length) or self._max_seq_length
+                )
+                model.max_seq_length = min(current, self._max_seq_length)
+            except Exception as exc:
+                log.debug("could not cap model max_seq_length: %s", exc)
+            with suppress(Exception):
+                model.eval()
+            dim = model.get_sentence_embedding_dimension()
             if dim:
                 self._dim = int(dim)
             self._provider = "sentence-transformers"
             self._precision = precision_name
-            self._max_seq_length = int(getattr(self._model, "max_seq_length", self._max_seq_length) or self._max_seq_length)
-            log.warning(
+            self._max_seq_length = int(
+                getattr(model, "max_seq_length", self._max_seq_length) or self._max_seq_length
+            )
+            log.info(
                 "loaded embedding model=%s device=%s dim=%s precision=%s max_seq_length=%s batch_size=%s tokenizer_threads=%s",
                 self.settings.embedding_model,
                 self.device,
@@ -117,8 +166,27 @@ class EmbeddingModel:
             )
         except Exception as exc:
             if not self.settings.embedding_allow_hash_fallback:
+                env = embedding_environment()
+                hints: list[str] = []
+                if env["sentence_transformers"] == "not-installed":
+                    hints.append(
+                        "install embedding dependencies with `uv sync --extra mac-metal --extra code`"
+                    )
+                if self.settings.embedding_local_files_only:
+                    hints.append(
+                        "the server is in local-files-only mode; prefetch with "
+                        "`BRAG_EMBEDDING_LOCAL_FILES_ONLY=false brag warmup --no-vectors` "
+                        "using the same HF_HOME/cache and model revision"
+                    )
+                if env["transformers"].split(".", 1)[0] == "5":
+                    hints.append(
+                        "CodeRankEmbed is incompatible with Transformers 5.x; install the pinned 4.45.1 release"
+                    )
+                details = "; ".join(f"{key}={value}" for key, value in env.items())
+                hint_text = f" Hints: {'; '.join(hints)}." if hints else ""
                 raise RuntimeError(
-                    f"failed to load embedding model {self.settings.embedding_model!r}; hash fallback is disabled"
+                    f"failed to load embedding model {self.settings.embedding_model!r}: "
+                    f"{type(exc).__name__}: {exc}.{hint_text} Environment: {details}"
                 ) from exc
             log.warning("sentence-transformers unavailable; using hash fallback: %s", exc)
 
@@ -140,7 +208,9 @@ class EmbeddingModel:
         return "|".join(
             [
                 self.settings.embedding_model,
+                self.settings.embedding_revision or "default",
                 self._provider,
+                self.device,
                 str(self._dim),
                 str(self.settings.normalize_embeddings),
                 str(self._max_seq_length),
@@ -171,8 +241,8 @@ class EmbeddingModel:
                 torch.cuda.empty_cache()
             elif self.device == "mps" and hasattr(torch, "mps"):
                 torch.mps.empty_cache()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("device cache cleanup failed: %s", exc)
 
     def embed_texts(self, texts: list[str], *, is_query: bool = False) -> np.ndarray:
         if not texts:
@@ -187,6 +257,7 @@ class EmbeddingModel:
         if self._model is not None:
             try:
                 import torch
+
                 context_factory = torch.inference_mode
             except Exception:
                 context_factory = _NullContext
@@ -210,11 +281,22 @@ class EmbeddingModel:
                     break
                 except RuntimeError as exc:
                     message = str(exc).lower()
-                    if batch_size <= 1 or not any(token in message for token in ("out of memory", "mps backend", "allocation")):
+                    allocation_failure = any(
+                        token in message
+                        for token in (
+                            "out of memory",
+                            "mps backend out of memory",
+                            "failed to allocate",
+                            "allocation failed",
+                        )
+                    )
+                    if batch_size <= 1 or not allocation_failure:
                         raise
                     batch_size = max(1, batch_size // 2)
                     self._effective_batch_size = batch_size
-                    log.warning("embedding allocation failure; retrying with batch_size=%s", batch_size)
+                    log.warning(
+                        "embedding allocation failure; retrying with batch_size=%s", batch_size
+                    )
                     self._empty_device_cache(force=True)
             self._empty_device_cache()
             return np.asarray(arr, dtype="float32")
@@ -256,21 +338,25 @@ class EmbeddingModel:
                 self.embed_texts(texts)
                 elapsed = time.perf_counter() - started
                 rate = len(texts) / elapsed if elapsed else 0.0
-                results.append({
-                    "batch_size": candidate,
-                    "elapsed_ms": round(elapsed * 1000, 3),
-                    "texts_per_second": round(rate, 3),
-                    "ok": True,
-                })
+                results.append(
+                    {
+                        "batch_size": candidate,
+                        "elapsed_ms": round(elapsed * 1000, 3),
+                        "texts_per_second": round(rate, 3),
+                        "ok": True,
+                    }
+                )
                 if rate > best_rate:
                     best_rate = rate
                     best_batch = self._effective_batch_size
             except Exception as exc:
-                results.append({
-                    "batch_size": candidate,
-                    "ok": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
+                results.append(
+                    {
+                        "batch_size": candidate,
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
                 self._empty_device_cache(force=True)
         self._effective_batch_size = best_batch
         return {
@@ -289,7 +375,10 @@ class EmbeddingModel:
             padded = f"  {text.lower()}  "
             for i in range(max(1, len(padded) - 2)):
                 gram = padded[i : i + 3]
-                h = int.from_bytes(hashlib.blake2b(gram.encode("utf-8", "ignore"), digest_size=8).digest(), "little")
+                h = int.from_bytes(
+                    hashlib.blake2b(gram.encode("utf-8", "ignore"), digest_size=8).digest(),
+                    "little",
+                )
                 idx = h % self._dim
                 sign = 1.0 if (h >> 63) == 0 else -1.0
                 vectors[row, idx] += sign
