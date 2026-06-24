@@ -15,8 +15,6 @@ SYMBOL_RE = re.compile(
 )
 
 
-
-
 def _chunk_id(
     doc: Document,
     *,
@@ -117,6 +115,8 @@ def chunk_document(
     text = doc.text
     if not text.strip():
         return []
+    if doc.metadata.get("document_type") == "pdf":
+        return _chunk_pdf_document(doc, settings)
     language = detect_language(doc.rel_path)
     if language:
         syms = symbols if symbols is not None else extract_symbols(doc)
@@ -307,11 +307,7 @@ def _make_chunk(
     }
     if extra:
         metadata.update(extra)
-    anchor = str(
-        (extra or {}).get("symbol_id")
-        or (extra or {}).get("qualified_name")
-        or section
-    )
+    anchor = str((extra or {}).get("symbol_id") or (extra or {}).get("qualified_name") or section)
     part = str((extra or {}).get("part", ""))
     cid = _chunk_id(
         doc,
@@ -377,9 +373,7 @@ def _chunk_text_document(
             metadata = dict(prev.metadata)
             metadata.setdefault("language", language)
             metadata.setdefault("chunk_type", chunk_type)
-            merged_digest = hashlib.blake2b(
-                merged_text.encode("utf-8"), digest_size=16
-            ).hexdigest()
+            merged_digest = hashlib.blake2b(merged_text.encode("utf-8"), digest_size=16).hexdigest()
             identity_key = (chunk_type, prev.section, merged_digest)
             occurrence = id_counts.get(identity_key, 0)
             id_counts[identity_key] = occurrence + 1
@@ -474,4 +468,152 @@ def _chunk_text_document(
             cur_texts.append(piece)
             cur_tokens += tokens
     flush()
+    return chunks
+
+
+def _bbox_union(blocks: list[dict]) -> list[float]:
+    boxes = [block.get("bbox", [0, 0, 0, 0]) for block in blocks if block.get("bbox")]
+    if not boxes:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [
+        round(min(float(box[0]) for box in boxes), 2),
+        round(min(float(box[1]) for box in boxes), 2),
+        round(max(float(box[2]) for box in boxes), 2),
+        round(max(float(box[3]) for box in boxes), 2),
+    ]
+
+
+def _chunk_pdf_document(doc: Document, settings: Settings) -> list[Chunk]:
+    pages = list(doc.metadata.get("pages", []))
+    if not pages:
+        return []
+    chunks: list[Chunk] = []
+    target_tokens = max(128, settings.pdf_chunk_tokens)
+    overlap_tokens = max(0, settings.pdf_chunk_overlap)
+    global_line = 1
+    occurrence_by_key: dict[tuple[str, str, str], int] = {}
+    outline_by_page: dict[int, str] = {}
+    for item in doc.metadata.get("outline", []):
+        page_no = int(item.get("page", 0) or 0)
+        title = str(item.get("title", "")).strip()
+        if page_no and title:
+            outline_by_page[page_no] = title
+
+    for page in pages:
+        blocks = [block for block in page.get("blocks", []) if str(block.get("text", "")).strip()]
+        if not blocks:
+            continue
+        page_number = int(page.get("number", 0) or 0)
+        page_label = str(page.get("label", page_number))
+        current_section = outline_by_page.get(page_number, "")
+        current: list[dict] = []
+        current_tokens = 0
+        block_index = 0
+        local_line = 1
+
+        def flush(
+            section_name: str,
+            *,
+            page_data: dict = page,
+            page_no: int = page_number,
+            label: str = page_label,
+        ) -> None:
+            nonlocal current, current_tokens, global_line, local_line
+            if not current:
+                return
+            text = "\n\n".join(str(block["text"]).strip() for block in current).strip()
+            if not text:
+                current = []
+                current_tokens = 0
+                return
+            kinds = {str(block.get("kind", "text")) for block in current}
+            chunk_type = (
+                "pdf_table"
+                if kinds == {"table"}
+                else "pdf_code"
+                if kinds == {"code"}
+                else "pdf_text"
+            )
+            section = section_name or f"Page {label}"
+            digest = hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+            identity_key = (chunk_type, f"{page_no}:{section}", digest)
+            occurrence = occurrence_by_key.get(identity_key, 0)
+            occurrence_by_key[identity_key] = occurrence + 1
+            line_count = max(1, text.count("\n") + 1)
+            start = int(page_data.get("start", 0))
+            end = int(page_data.get("end", start + len(text)))
+            cid = _chunk_id(
+                doc,
+                text=text,
+                chunk_type=chunk_type,
+                anchor=f"page:{page_no}:{section}",
+                occurrence=occurrence,
+            )
+            chunks.append(
+                Chunk(
+                    id=cid,
+                    doc_id=doc.doc_id,
+                    root=doc.root.as_posix(),
+                    path=doc.rel_path,
+                    title=doc.title,
+                    section=section[:240],
+                    text=text,
+                    line_start=global_line,
+                    line_end=global_line + line_count - 1,
+                    byte_start=start,
+                    byte_end=end,
+                    content_hash=doc.content_hash,
+                    metadata={
+                        "mtime_ns": doc.mtime_ns,
+                        "size_bytes": doc.size_bytes,
+                        "language": "pdf",
+                        "document_type": "pdf",
+                        "chunk_type": chunk_type,
+                        "page": page_no,
+                        "page_label": label,
+                        "page_count": int(doc.metadata.get("page_count", 0) or 0),
+                        "bbox": _bbox_union(current),
+                        "ocr": bool(page_data.get("ocr", False)),
+                        "ocr_error": str(page_data.get("ocr_error", "")),
+                        "extractor": str(doc.metadata.get("extractor", "pymupdf")),
+                        "source_title": doc.title,
+                        "block_kinds": sorted(kinds),
+                    },
+                )
+            )
+            global_line += line_count
+            local_line += line_count
+            if overlap_tokens > 0:
+                carry: list[dict] = []
+                carry_tokens = 0
+                for block in reversed(current):
+                    tokens = _cheap_token_count(str(block["text"]))
+                    if carry and carry_tokens + tokens > overlap_tokens:
+                        break
+                    carry.append(block)
+                    carry_tokens += tokens
+                current = list(reversed(carry))
+                current_tokens = carry_tokens
+            else:
+                current = []
+                current_tokens = 0
+
+        while block_index < len(blocks):
+            block = blocks[block_index]
+            block_index += 1
+            kind = str(block.get("kind", "text"))
+            text = str(block.get("text", "")).strip()
+            if kind == "heading":
+                if current and current_tokens >= max(64, target_tokens // 3):
+                    flush(current_section)
+                current_section = text[:240]
+                continue
+            tokens = _cheap_token_count(text)
+            if current and current_tokens + tokens > target_tokens:
+                flush(current_section)
+            current.append(block)
+            current_tokens += tokens
+            if kind == "table" or tokens >= target_tokens:
+                flush(current_section)
+        flush(current_section)
     return chunks

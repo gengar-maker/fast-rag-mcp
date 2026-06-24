@@ -775,7 +775,7 @@ class Store:
         placeholders = ",".join("?" for _ in chunk_ids)
         rows = self.conn.execute(
             f"SELECT * FROM chunks WHERE id IN ({placeholders})",  # nosec B608
-            tuple(chunk_ids)
+            tuple(chunk_ids),
         ).fetchall()
         by_id = {r["id"]: dict(r) for r in rows}
         return [by_id[cid] for cid in chunk_ids if cid in by_id]
@@ -813,16 +813,30 @@ class Store:
         return out
 
     def fts_search(
-        self, query: str, limit: int, path_prefix: str | None = None
+        self,
+        query: str,
+        limit: int,
+        path_prefix: str | None = None,
+        chunk_type_prefix: str | None = None,
     ) -> list[tuple[str, float]]:
-        sql = """
-          SELECT chunk_id, bm25(chunks_fts, 1.4, 1.2, 1.8, 1.0) AS rank
-          FROM chunks_fts
-          WHERE chunks_fts MATCH ?
-        """
-        params: list[object] = [self._fts_query(query)]
+        if chunk_type_prefix:
+            sql = """
+              SELECT f.chunk_id, bm25(chunks_fts, 1.4, 1.2, 1.8, 1.0) AS rank
+              FROM chunks_fts f JOIN chunks c ON c.id = f.chunk_id
+              WHERE chunks_fts MATCH ? AND c.chunk_type LIKE ?
+            """
+            params: list[object] = [self._fts_query(query), f"{chunk_type_prefix}%"]
+            path_column = "c.path"
+        else:
+            sql = """
+              SELECT chunk_id, bm25(chunks_fts, 1.4, 1.2, 1.8, 1.0) AS rank
+              FROM chunks_fts
+              WHERE chunks_fts MATCH ?
+            """
+            params = [self._fts_query(query)]
+            path_column = "path"
         if path_prefix:
-            sql += " AND path LIKE ?"
+            sql += f" AND {path_column} LIKE ?"  # nosec B608
             params.append(f"{path_prefix}%")
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
@@ -831,6 +845,116 @@ class Store:
         except sqlite3.OperationalError:
             return []
         return [(str(r["chunk_id"]), float(-r["rank"])) for r in rows]
+
+    def filter_chunk_ids(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        chunk_type_prefix: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[str]:
+        if not chunk_ids:
+            return []
+        placeholders = ",".join("?" for _ in chunk_ids)
+        sql = f"SELECT id FROM chunks WHERE id IN ({placeholders})"  # nosec B608
+        params: list[object] = list(chunk_ids)
+        if chunk_type_prefix:
+            sql += " AND chunk_type LIKE ?"
+            params.append(f"{chunk_type_prefix}%")
+        if path_prefix:
+            sql += " AND path LIKE ?"
+            params.append(f"{path_prefix}%")
+        allowed = {str(row["id"]) for row in self.conn.execute(sql, params).fetchall()}
+        return [chunk_id for chunk_id in chunk_ids if chunk_id in allowed]
+
+    def document_path_search(
+        self, query: str, limit: int, path_prefix: str | None = None
+    ) -> list[dict]:
+        terms = _split_query_terms(query)
+        if not terms:
+            return []
+        clauses: list[str] = []
+        params: list[object] = []
+        for term in terms[:5]:
+            clauses.append("(lower(d.path) LIKE ? OR lower(d.title) LIKE ?)")
+            value = f"%{term.lower()}%"
+            params.extend([value, value])
+        where_clause = " AND ".join(clauses)
+        sql = (  # nosec B608
+            f"SELECT d.*, 1.0 AS score FROM docs d WHERE {where_clause} "  # nosec B608
+            "AND EXISTS (SELECT 1 FROM chunks c "
+            "WHERE c.doc_id=d.doc_id AND c.chunk_type LIKE 'pdf_%')"
+        )
+        if path_prefix:
+            sql += " AND d.path LIKE ?"
+            params.append(f"{path_prefix}%")
+        sql += " ORDER BY length(d.path), d.path LIMIT ?"
+        params.append(limit)
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def adjacent_chunks(self, doc_id: str, ord_value: int, radius: int) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM chunks
+            WHERE doc_id=? AND ord BETWEEN ? AND ?
+            ORDER BY ord
+            """,
+            (doc_id, max(0, ord_value - radius), ord_value + radius),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def document_outline(self, path_or_doc_id: str, limit: int = 500) -> dict:
+        doc = self.conn.execute(
+            "SELECT * FROM docs WHERE doc_id=? OR path=? LIMIT 1",
+            (path_or_doc_id, path_or_doc_id),
+        ).fetchone()
+        if doc is None:
+            like = f"%{path_or_doc_id}%"
+            doc = self.conn.execute(
+                "SELECT * FROM docs WHERE path LIKE ? AND lower(path) LIKE '%.pdf' ORDER BY length(path) LIMIT 1",
+                (like,),
+            ).fetchone()
+        if doc is None:
+            raise KeyError(f"PDF document not found: {path_or_doc_id}")
+        rows = self.conn.execute(
+            """
+            SELECT id, section, chunk_type, metadata_json, ord
+            FROM chunks
+            WHERE doc_id=? AND chunk_type LIKE 'pdf_%'
+            ORDER BY ord LIMIT ?
+            """,
+            (doc["doc_id"], limit),
+        ).fetchall()
+        items: list[dict] = []
+        seen: set[tuple[int, str]] = set()
+        max_page = 0
+        for row in rows:
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            page = int(meta.get("page", 0) or 0)
+            max_page = max(max_page, page)
+            key = (page, str(row["section"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                {
+                    "page": page,
+                    "page_label": meta.get("page_label", page),
+                    "section": row["section"],
+                    "chunk_type": row["chunk_type"],
+                    "resource_uri": f"rag://{doc['doc_id']}#chunk={row['id']}",
+                }
+            )
+        return {
+            "doc_id": doc["doc_id"],
+            "path": doc["path"],
+            "title": doc["title"],
+            "page_count": max_page,
+            "outline": items,
+        }
 
     def symbol_search(
         self, query: str, limit: int, path_prefix: str | None = None, kind: str | None = None
@@ -946,7 +1070,7 @@ class Store:
         placeholders = ",".join("?" for _ in symbol_ids)
         rows = self.conn.execute(
             f"SELECT * FROM symbols WHERE id IN ({placeholders})",  # nosec B608
-            tuple(symbol_ids)
+            tuple(symbol_ids),
         ).fetchall()
         by_id = {r["id"]: dict(r) for r in rows}
         return [by_id[sid] for sid in symbol_ids if sid in by_id]
@@ -997,26 +1121,16 @@ class Store:
         )
         symbols_sql = (
             "SELECT id, doc_id, path, language, kind, name, qualified_name, "  # nosec B608
-            "line_start, line_end FROM symbols "
-            + where
-            + " ORDER BY path, line_start LIMIT ?"
+            "line_start, line_end FROM symbols " + where + " ORDER BY path, line_start LIMIT ?"
         )
         languages_sql = (
             "SELECT language, COUNT(*) AS symbols FROM symbols "  # nosec B608
             + where
             + " GROUP BY language ORDER BY symbols DESC"
         )
-        docs = [
-            dict(r)
-            for r in self.conn.execute(docs_sql, [*params, limit]).fetchall()
-        ]
-        symbols = [
-            dict(r)
-            for r in self.conn.execute(symbols_sql, [*params, limit * 3]).fetchall()
-        ]
-        languages = [
-            dict(r) for r in self.conn.execute(languages_sql, params).fetchall()
-        ]
+        docs = [dict(r) for r in self.conn.execute(docs_sql, [*params, limit]).fetchall()]
+        symbols = [dict(r) for r in self.conn.execute(symbols_sql, [*params, limit * 3]).fetchall()]
+        languages = [dict(r) for r in self.conn.execute(languages_sql, params).fetchall()]
         by_doc: dict[str, list[dict]] = {}
         for sym in symbols:
             by_doc.setdefault(sym["doc_id"], []).append(sym)
@@ -1074,6 +1188,12 @@ class Store:
         symbols = self.conn.execute("SELECT COUNT(*) AS c FROM symbols").fetchone()["c"]
         refs = self.conn.execute("SELECT COUNT(*) AS c FROM refs").fetchone()["c"]
         vecs = self.conn.execute("SELECT COUNT(*) AS c FROM vectors").fetchone()["c"]
+        pdf_chunks = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM chunks WHERE chunk_type LIKE 'pdf_%'"
+        ).fetchone()["c"]
+        pdf_docs = self.conn.execute(
+            "SELECT COUNT(DISTINCT doc_id) AS c FROM chunks WHERE chunk_type LIKE 'pdf_%'"
+        ).fetchone()["c"]
         try:
             db_bytes = self.path.stat().st_size
         except OSError:
@@ -1089,6 +1209,8 @@ class Store:
             "symbols": int(symbols),
             "references": int(refs),
             "vectors": int(vecs),
+            "pdf_documents": int(pdf_docs),
+            "pdf_chunks": int(pdf_chunks),
             "corpus_version": self.corpus_version(),
         }
 

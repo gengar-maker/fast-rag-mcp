@@ -217,7 +217,13 @@ class Indexer:
                         continue
 
                 read_started = time.perf_counter()
-                doc = read_document(root, path, self.settings)
+                try:
+                    doc = read_document(root, path, self.settings)
+                except Exception as exc:
+                    scan_hash_seconds += time.perf_counter() - read_started
+                    errors.append(f"{path.as_posix()}: {type(exc).__name__}: {exc}")
+                    log.exception("failed to read %s", path)
+                    continue
                 scan_hash_seconds += time.perf_counter() - read_started
                 if doc is None:
                     errors.append(f"{path.as_posix()}: unreadable or unsupported file")
@@ -230,8 +236,9 @@ class Indexer:
 
                 prep_started = time.perf_counter()
                 try:
-                    symbols = extract_symbols(doc)
-                    references = extract_references(doc, symbols)
+                    is_pdf = doc.metadata.get("document_type") == "pdf"
+                    symbols = [] if is_pdf else extract_symbols(doc)
+                    references = [] if is_pdf else extract_references(doc, symbols)
                     raw_chunks = chunk_document(doc, self.settings, symbols=symbols)
                     if not raw_chunks:
                         continue
@@ -256,9 +263,10 @@ class Indexer:
                     ):
                         old_vectors = self.store.document_vector_cache(doc.doc_id)
                     slots = [old_vectors.get(value) for value in hashes]
+                    stored_doc = replace(doc, metadata={}) if is_pdf else doc
                     pending.append(
                         _PreparedDocument(
-                            doc=doc,
+                            doc=stored_doc,
                             chunks=chunks,
                             symbols=symbols,
                             references=references,
@@ -406,6 +414,14 @@ def _embedding_text(chunk: Chunk) -> str:
         f"language: {metadata.get('language', '')}",
         f"chunk_type: {metadata.get('chunk_type', '')}",
     ]
+    if metadata.get("document_type") == "pdf":
+        parts.extend(
+            [
+                f"document: {metadata.get('source_title', chunk.title)}",
+                f"page: {metadata.get('page_label', metadata.get('page', ''))}",
+                f"section: {chunk.section}",
+            ]
+        )
     if metadata.get("qualified_name"):
         parts.append(f"symbol: {metadata.get('qualified_name')}")
     if metadata.get("symbol_kind"):

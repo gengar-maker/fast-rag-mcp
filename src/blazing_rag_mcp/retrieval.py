@@ -175,6 +175,124 @@ class Retriever:
         self._search_cache[cache_key] = result
         return result
 
+    def document_search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        mode: Literal["hybrid", "semantic", "keyword"] = "hybrid",
+        path_prefix: str | None = None,
+        include_text: bool = False,
+    ) -> dict:
+        """Search PDF documentation with page-aware results and PDF-only filtering."""
+        started = time.perf_counter()
+        top_k = min(max(1, top_k or self.settings.default_top_k), self.settings.max_top_k)
+        cache_key = json.dumps(
+            {
+                "v": self.store.corpus_version(),
+                "scope": "pdf",
+                "q": query,
+                "k": top_k,
+                "mode": mode,
+                "path_prefix": path_prefix,
+                "include_text": include_text,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            result = dict(cached)
+            result["cached"] = True
+            return result
+
+        timings: dict[str, float] = {}
+        dense: list[tuple[str, float]] = []
+        sparse: list[tuple[str, float]] = []
+        paths: list[tuple[str, float]] = []
+        candidate_limit = min(
+            max(self.settings.candidate_k, top_k * self.settings.pdf_dense_candidate_multiplier),
+            4000,
+        )
+        if mode in ("hybrid", "semantic"):
+            t0 = time.perf_counter()
+            embeddings = self._embeddings()
+            qvec = embeddings.embed_query(query, query_prefix=self.settings.pdf_query_prefix)
+            timings["embed_ms"] = _ms(t0)
+            t0 = time.perf_counter()
+            vector_index = self._vector_index()
+            raw_dense = vector_index.search(qvec, candidate_limit)
+            allowed = set(
+                self.store.filter_chunk_ids(
+                    [chunk_id for chunk_id, _ in raw_dense],
+                    chunk_type_prefix="pdf_",
+                    path_prefix=path_prefix,
+                )
+            )
+            dense = [(chunk_id, score) for chunk_id, score in raw_dense if chunk_id in allowed]
+            timings["dense_ms"] = _ms(t0)
+
+        if mode in ("hybrid", "keyword"):
+            t0 = time.perf_counter()
+            sparse = self.store.fts_search(
+                query,
+                candidate_limit,
+                path_prefix=path_prefix,
+                chunk_type_prefix="pdf_",
+            )
+            timings["fts_ms"] = _ms(t0)
+            path_hits = self.store.document_path_search(
+                query, min(50, candidate_limit), path_prefix
+            )
+            path_chunks = self.store.chunks_for_docs(
+                [row["doc_id"] for row in path_hits], limit_per_doc=1
+            )
+            path_rank = {row["doc_id"]: index + 1 for index, row in enumerate(path_hits)}
+            paths = [
+                (chunk["id"], 1.0 / path_rank.get(chunk["doc_id"], 1))
+                for chunk in path_chunks
+                if str(chunk.get("chunk_type", "")).startswith("pdf_")
+            ]
+
+        scores: dict[str, float] = {}
+        rrf_k = self.settings.rrf_k
+        for weight, candidates in (
+            (self.settings.dense_weight, dense),
+            (self.settings.fts_weight, sparse),
+            (self.settings.code_path_weight, paths),
+        ):
+            for result_rank, (chunk_id, _raw) in enumerate(candidates, start=1):
+                scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (rrf_k + result_rank)
+        if mode == "semantic":
+            fused = dense
+        elif mode == "keyword":
+            fused = sparse
+        else:
+            fused = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        chunk_ids = [chunk_id for chunk_id, _ in fused[:top_k]]
+        chunks = self.store.get_chunks(chunk_ids)
+        by_score = dict(fused)
+        results = [
+            self._pack_chunk(chunk, by_score.get(chunk["id"], 0.0), include_text)
+            for chunk in chunks
+        ]
+        result = {
+            "query": query,
+            "scope": "pdf",
+            "mode": mode,
+            "corpus_version": self.store.corpus_version(),
+            "cached": False,
+            "results": results,
+            "timings_ms": {**timings, "total_ms": _ms(started)},
+        }
+        self._search_cache[cache_key] = result
+        return result
+
+    def document_outline(self, path_or_doc_id: str, limit: int = 500) -> dict:
+        started = time.perf_counter()
+        result = self.store.document_outline(path_or_doc_id, limit=limit)
+        result["timings_ms"] = {"total_ms": _ms(started)}
+        return result
+
     def find_symbol(
         self,
         name: str,
@@ -295,7 +413,8 @@ class Retriever:
         text = chunk["text"]
         if len(text) > self.settings.max_fetch_chars:
             text = text[: self.settings.max_fetch_chars] + "\n...[truncated]"
-        return {
+        metadata = _loads(chunk["metadata_json"] or "{}")
+        response = {
             "resource_uri": f"rag://{chunk['doc_id']}#chunk={chunk['id']}",
             "id": chunk["id"],
             "doc_id": chunk["doc_id"],
@@ -310,8 +429,26 @@ class Retriever:
             "line_start": chunk["line_start"],
             "line_end": chunk["line_end"],
             "text": text,
-            "metadata": _loads(chunk["metadata_json"] or "{}"),
+            "metadata": metadata,
         }
+        if metadata.get("document_type") == "pdf":
+            response["citation"] = f"{chunk['path']}#page={metadata.get('page', '')}"
+        if context_chunks > 0:
+            radius = min(max(0, context_chunks), 4)
+            neighbors = self.store.adjacent_chunks(
+                chunk["doc_id"], int(chunk.get("ord", 0)), radius
+            )
+            response["context"] = [
+                {
+                    "id": row["id"],
+                    "resource_uri": f"rag://{row['doc_id']}#chunk={row['id']}",
+                    "section": row["section"],
+                    "text": row["text"][: self.settings.max_fetch_chars],
+                    "metadata": _loads(row["metadata_json"] or "{}"),
+                }
+                for row in neighbors
+            ]
+        return response
 
     def _symbol_hits_to_chunks(self, symbol_hits: list[dict]) -> list[tuple[str, float]]:
         symbol_ids = [s["id"] for s in symbol_hits]
@@ -382,6 +519,18 @@ class Retriever:
             "line_end": chunk["line_end"],
             "snippet": snippet,
         }
+        metadata = _loads(chunk.get("metadata_json", "{}"))
+        if metadata.get("document_type") == "pdf":
+            out.update(
+                {
+                    "document_type": "pdf",
+                    "page": metadata.get("page"),
+                    "page_label": metadata.get("page_label"),
+                    "bbox": metadata.get("bbox"),
+                    "ocr": metadata.get("ocr", False),
+                    "citation": f"{chunk['path']}#page={metadata.get('page', '')}",
+                }
+            )
         if out["symbol_id"]:
             out["symbol_uri"] = f"symbol://{out['symbol_id']}"
         if include_text:

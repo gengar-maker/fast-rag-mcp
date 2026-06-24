@@ -45,6 +45,14 @@ def test_mcp_initialize_and_tools_list_without_heavy_runtime(tmp_path) -> None:
             tools = await session.list_tools()
             assert initialized.serverInfo.name == "blazing-code-rag"
             names = {tool.name for tool in tools.tools}
-            assert {"code_search", "code_update_index", "rag_doctor"} <= names
+            assert {
+                "code_search",
+                "code_update_index",
+                "document_search",
+                "document_outline",
+                "document_fetch",
+                "document_update_index",
+                "rag_doctor",
+            } <= names
 
     anyio.run(exercise)

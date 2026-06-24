@@ -207,9 +207,7 @@ IMPORT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*package\s+([\w.]+)", re.MULTILINE),
 )
 
-MEMBER_CALL_RE = re.compile(
-    r"(?:[A-Za-z_$][\w$]*\.)+([A-Za-z_$][\w$]{1,80})\s*\("
-)
+MEMBER_CALL_RE = re.compile(r"(?:[A-Za-z_$][\w$]*\.)+([A-Za-z_$][\w$]{1,80})\s*\(")
 CALL_RE = re.compile(r"(?<![.\w$])([A-Za-z_$][\w$]{1,80})\s*\(")
 SKIP_CALL_NAMES = {
     "if",
@@ -249,16 +247,16 @@ def _get_parser(language: str) -> Any | None:
         return None
     # Preferred modern package: prebuilt wheels with get_parser/get_language.
     try:
-        from tree_sitter_language_pack import get_parser
+        from tree_sitter_language_pack import get_parser as get_pack_parser
 
-        return get_parser(language)
+        return get_pack_parser(language)  # type: ignore[arg-type]
     except Exception as exc:
         log.debug("tree-sitter-language-pack parser unavailable for %s: %s", language, exc)
     # Older package still exists and has the same basic get_parser API, but is unmaintained.
     try:
-        from tree_sitter_languages import get_parser
+        from tree_sitter_languages import get_parser as get_legacy_parser
 
-        return get_parser(language)
+        return get_legacy_parser(language)
     except Exception as exc:
         log.debug("tree-sitter parser unavailable for %s: %s", language, exc)
         return None

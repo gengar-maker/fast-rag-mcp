@@ -55,6 +55,7 @@ TEXT_EXTENSIONS = {
     ".dockerfile",
     ".ini",
     ".cfg",
+    ".pdf",
 }
 
 
@@ -186,8 +187,11 @@ def _accept_file(root: Path, path: Path, settings: Settings, stats: ScanStats | 
                 stats.files_skipped_pattern += 1
             return False
         stat = path.stat()
-        if not path.is_file() or stat.st_size > settings.max_file_bytes:
-            if stats is not None and stat.st_size > settings.max_file_bytes:
+        size_limit = (
+            settings.max_pdf_bytes if path.suffix.lower() == ".pdf" else settings.max_file_bytes
+        )
+        if not path.is_file() or stat.st_size > size_limit:
+            if stats is not None and stat.st_size > size_limit:
                 stats.files_skipped_size += 1
                 stats.add_largest(stat.st_size, path)
             return False
@@ -396,6 +400,10 @@ def resolve_requested_paths(settings: Settings, requested: Sequence[str]) -> Req
 
 
 def read_document(root: Path, path: Path, settings: Settings) -> Document | None:
+    if path.suffix.lower() == ".pdf":
+        from .pdf_ingest import read_pdf_document
+
+        return read_pdf_document(root, path, settings)
     try:
         stat = path.stat()
         if stat.st_size > settings.max_file_bytes:

@@ -1,6 +1,6 @@
-# blazing-rag-mcp 1.0
+# blazing-rag-mcp 1.1
 
-Production-oriented local code-intelligence MCP server for Claude Code and opencode. It combines structural code indexing, exact symbol/path lookup, SQLite FTS5, shallow reference extraction, and optional dense retrieval accelerated by Apple Metal/MPS or CUDA.
+Production-oriented local code and PDF-documentation MCP server for Claude Code and opencode. It combines structural code indexing, page-aware PDF extraction, exact symbol/path lookup, SQLite FTS5, shallow reference extraction, and optional dense retrieval accelerated by Apple Metal/MPS or CUDA.
 
 The server is optimized for a persistent local MCP process. Heavy resources are lazy: Claude can complete the MCP handshake before PyTorch, the embedding model, or the vector matrix are loaded.
 
@@ -17,6 +17,8 @@ The server is optimized for a persistent local MCP process. Heavy resources are 
 - SQLite WAL mode for normal operation and disposable staging DBs for atomic full rebuilds.
 - Lazy vector invalidation: incremental updates do not synchronously rebuild the complete in-memory vector matrix.
 - True SQLite read-only query connection by default; writer connections exist only during locked index mutations.
+- Page-aware PDF chunks with citations, layout metadata, repeated header/footer removal, optional OCR, and optional table extraction.
+- Dedicated PDF search, outline, fetch, and targeted-update tools.
 - Integrity, compatibility, lifecycle, and timing diagnostics.
 
 ## Architecture
@@ -35,6 +37,7 @@ Application lifecycle
   └── serialized Indexer mutations
         │
         ├── symbols / paths / references / FTS5
+        ├── PDF pages / sections / citations / optional OCR
         └── dense vectors: NumPy, Torch MPS/CUDA, or FAISS
 ```
 
@@ -44,7 +47,7 @@ The MCP transport does not own indexing logic. `Application` owns process-lifeti
 
 ```bash
 cd /absolute/path/to/blazing-rag-mcp-production
-uv sync --extra mac-metal --extra code
+uv sync --extra mac-metal --extra code --extra documents
 ```
 
 Use the installed executable directly from MCP clients:
@@ -54,6 +57,81 @@ Use the installed executable directly from MCP clients:
 ```
 
 Do not put `uv run` on the MCP startup path unless necessary. Direct execution avoids dependency resolution and PATH differences during client initialization.
+
+## PDF documentation indexing
+
+Install the optional document extractor:
+
+```bash
+uv sync --extra mac-metal --extra code --extra documents
+```
+
+PDF files under `BRAG_ROOTS` are discovered automatically. Text is extracted page-by-page with PyMuPDF, sorted into reading order, and chunked without crossing page boundaries. Each result includes `page`, `page_label`, bounding box metadata and a stable citation such as:
+
+```text
+docs/reference-manual.pdf#page=42
+```
+
+Index a documentation directory or one changed PDF:
+
+```bash
+.venv/bin/brag index docs/
+.venv/bin/brag index docs/reference-manual.pdf
+```
+
+Search from the CLI:
+
+```bash
+.venv/bin/brag docs "how is session token refresh configured" --top-k 8
+.venv/bin/brag outline docs/reference-manual.pdf
+```
+
+MCP tools:
+
+```text
+document_search(query, top_k?, mode?, path_prefix?, include_text?)
+document_outline(path_or_doc_id, limit?)
+document_fetch(resource_uri? | chunk_id?, context_chunks=1)
+document_update_index(paths, refresh_vectors=false)
+```
+
+The existing `code_update_index` and `rag_reindex(paths=[...])` also accept PDF paths.
+
+Recommended PDF settings:
+
+```bash
+BRAG_MAX_PDF_BYTES=200000000
+BRAG_PDF_MAX_PAGES=2000
+BRAG_PDF_MAX_CHARS=20000000
+BRAG_PDF_CHUNK_TOKENS=512
+BRAG_PDF_CHUNK_OVERLAP=48
+BRAG_PDF_DENSE_CANDIDATE_MULTIPLIER=8
+BRAG_PDF_QUERY_PREFIX="Represent this query for retrieving relevant technical documentation:"
+BRAG_PDF_OCR_MODE=off
+BRAG_PDF_EXTRACT_TABLES=false
+```
+
+### Scanned PDFs and OCR
+
+OCR is opt-in because it is much slower than native text extraction. PyMuPDF delegates OCR to a separately installed Tesseract executable and language data:
+
+```bash
+brew install tesseract
+export BRAG_PDF_OCR_MODE=auto
+export BRAG_PDF_OCR_LANGUAGE=eng
+```
+
+`auto` OCR runs only on low-text pages that contain images. Use `always` only for known scanned corpora. OCR failures are recorded in chunk metadata and do not abort extraction of normal text pages.
+
+### Tables
+
+Set `BRAG_PDF_EXTRACT_TABLES=true` to add Markdown-like `pdf_table` chunks. Table detection is disabled by default because it can dominate indexing time on long manuals. Normal text blocks remain available even when table extraction is disabled.
+
+### Embedding-model choice
+
+The default CodeRankEmbed model is optimized for code retrieval. It remains useful for technical manuals that contain APIs and code, but a PDF-heavy natural-language corpus may benefit from a general multilingual embedding model. Changing the embedding model requires `brag index --force` because the persisted vector space must remain consistent.
+
+PyMuPDF is an optional dependency with its own AGPL/commercial licensing terms; review them for your deployment.
 
 ## Initial configuration
 
@@ -92,11 +170,12 @@ Do not use `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0` as a performance setting. The 
 
 ## Fixing CodeRankEmbed load failures
 
-Version 1.0.1 pins the model-compatible runtime instead of allowing Transformers 5.x:
+Version 1.1 pins a Transformers 4.x runtime and an ABI3 tokenizer wheel instead of allowing Transformers 5.x:
 
 ```text
 sentence-transformers==3.4.1
-transformers==4.45.1
+transformers==4.47.1
+tokenizers==0.21.4
 huggingface-hub<1
 einops>=0.8,<1
 ```
@@ -107,11 +186,11 @@ environment after upgrading:
 
 ```bash
 rm -rf .venv
-uv sync --extra mac-metal --extra code
+uv sync --extra mac-metal --extra code --extra documents
 .venv/bin/python -c 'import sentence_transformers, transformers; print(sentence_transformers.__version__, transformers.__version__)'
 ```
 
-Expected versions are `3.4.1` and `4.45.1`. Use one explicit cache location for both terminal
+Expected versions are `3.4.1`, `4.47.1`, and `0.21.4` for sentence-transformers, Transformers, and tokenizers. The tokenizers wheel uses CPython ABI3, avoiding a local Rust build on Python 3.14. Use one explicit cache location for both terminal
 prefetch and Claude MCP:
 
 ```bash
@@ -140,7 +219,7 @@ The shipped profiles pin the reviewed `CodeRankEmbed` commit `3c4b60807d71f79b43
 BRAG_EMBEDDING_LOCAL_FILES_ONLY=false .venv/bin/brag warmup --no-vectors
 ```
 
-Production MCP templates set `BRAG_EMBEDDING_LOCAL_FILES_ONLY=true`, so the running server never downloads model files. Version 1.0 uses index format 2 with content-stable symbol/chunk IDs. Rebuild once after upgrading:
+Production MCP templates set `BRAG_EMBEDDING_LOCAL_FILES_ONLY=true`, so the running server never downloads model files. Version 1.1 uses index format 3, which adds page-aware PDF chunks. Rebuild once after upgrading:
 
 ```bash
 .venv/bin/brag scan
@@ -269,7 +348,11 @@ Use `configs/opencode.m3pro-36gb.jsonc`. It also invokes the installed executabl
 | `code_repo_map` | Compact structural map | No |
 | `code_fetch` | Fetch a chunk/symbol | No |
 | `code_search` | Symbol/path/FTS/dense hybrid retrieval | Only when dense route is needed |
-| `code_update_index` | Update selected paths | Only if new embeddings are needed |
+| `code_update_index` | Update selected code or document paths | Only if new embeddings are needed |
+| `document_search` | PDF-only hybrid/semantic/keyword search with page citations | Only for semantic/hybrid mode |
+| `document_outline` | PDF section/page outline | No |
+| `document_fetch` | Fetch a PDF hit with adjacent document context | No |
+| `document_update_index` | Targeted PDF update | Only if new embeddings are needed |
 | `rag_status` | Lifecycle/index status | Optional |
 | `rag_doctor` | Database/fingerprint checks | Optional |
 | `rag_warmup` | Load model and optionally vectors | Yes |
@@ -296,6 +379,8 @@ Use `configs/opencode.m3pro-36gb.jsonc`. It also invokes the installed executabl
 .venv/bin/brag search "where is backward attention implemented" --top-k 8
 .venv/bin/brag symbol flash_attn_backward
 .venv/bin/brag refs flash_attn_backward
+.venv/bin/brag docs "how is authentication configured" --top-k 8
+.venv/bin/brag outline docs/reference-manual.pdf
 ```
 
 ## Tuning M3 Pro
@@ -330,7 +415,7 @@ For repositories below roughly the configured `BRAG_MPS_VECTOR_MIN_VECTORS`, `ve
 ## Verification
 
 ```bash
-uv sync --extra code --extra dev
+uv sync --extra code --extra documents --extra dev
 uv run ruff check src tests
 uv run mypy src/blazing_rag_mcp
 uv run bandit -q -r src/blazing_rag_mcp

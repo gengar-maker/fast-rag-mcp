@@ -122,6 +122,17 @@ def main() -> None:
     search_parser.add_argument("--path-prefix", default=None)
     search_parser.add_argument("--include-text", action="store_true")
 
+    docs_parser = subparsers.add_parser("docs", help="Search indexed PDF documentation")
+    docs_parser.add_argument("query")
+    docs_parser.add_argument("--top-k", type=int, default=None)
+    docs_parser.add_argument("--mode", choices=["hybrid", "semantic", "keyword"], default="hybrid")
+    docs_parser.add_argument("--path-prefix", default=None)
+    docs_parser.add_argument("--include-text", action="store_true")
+
+    outline_parser = subparsers.add_parser("outline", help="Show an indexed PDF outline")
+    outline_parser.add_argument("path_or_doc_id")
+    outline_parser.add_argument("--limit", type=int, default=500)
+
     symbol_parser = subparsers.add_parser("symbol", help="Find symbols")
     symbol_parser.add_argument("name")
     symbol_parser.add_argument("--kind", default=None)
@@ -183,6 +194,18 @@ def main() -> None:
                     include_text=args.include_text,
                 )
             )
+        elif args.command == "docs":
+            _print_json(
+                app.document_search(
+                    query=args.query,
+                    top_k=args.top_k,
+                    mode=args.mode,
+                    path_prefix=args.path_prefix,
+                    include_text=args.include_text,
+                )
+            )
+        elif args.command == "outline":
+            _print_json(app.document_outline(path_or_doc_id=args.path_or_doc_id, limit=args.limit))
         elif args.command == "symbol":
             _print_json(
                 app.find_symbol(

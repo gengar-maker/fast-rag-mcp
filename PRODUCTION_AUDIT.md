@@ -1,3 +1,31 @@
+# Production audit - PDF documentation release 1.1.0
+
+## Added PDF path
+
+The PDF pipeline is isolated in `pdf_ingest.py` and is optional at install time. It uses PyMuPDF block extraction with reading-order sorting, page-local chunking, bounded resources, streaming SHA-256 hashing, repeated margin suppression, and optional OCR/table extraction. PDF extraction does not invoke Tree-sitter or write symbols/references.
+
+## Retrieval isolation
+
+`document_search` uses PDF-only FTS filtering and filters oversampled dense candidates to `pdf_*` chunks. Code retrieval remains symbol/path-first and is not slowed by PDF-specific extraction. PDF results expose page number, page label, bounding box, OCR status, and a stable `path#page=N` citation.
+
+## Operational constraints
+
+- OCR requires external Tesseract and is disabled by default.
+- Table detection is disabled by default because it can be expensive.
+- The configured embedding model is shared by code and PDFs; changing it requires a full rebuild.
+- PyMuPDF is optional and has AGPL/commercial licensing terms.
+- Index format 3 requires a one-time atomic forced rebuild.
+
+## Verification
+
+- Python compileall passed.
+- PDF extraction/chunking/search/outline/fetch tests passed.
+- Full test suite passed with MCP, PyMuPDF, and pinned Tree-sitter dependencies installed.
+- Ruff, mypy, and Bandit passed.
+
+
+---
+
 # Production audit
 
 ## Executive result
@@ -120,7 +148,7 @@ The remaining ~0.6–0.7 s fresh-process wall time in that synthetic test was Py
 
 ### Stable identities
 
-Index format 2 removes full-file hash and byte offsets from symbol/chunk identities. An unrelated line insertion no longer changes IDs for unchanged functions/chunks. This improves cached references and agent navigation stability.
+Index format 2 introduced stable identities that are retained in format 3. It removes full-file hash and byte offsets from symbol/chunk identities. An unrelated line insertion no longer changes IDs for unchanged functions/chunks. This improves cached references and agent navigation stability.
 
 ## Security hardening
 
@@ -145,7 +173,7 @@ Index format 2 removes full-file hash and byte offsets from symbol/chunk identit
 
 ## Upgrade requirement
 
-Index format is now `2`. Run once:
+The current release uses index format `3` for page-aware PDF metadata. Run once:
 
 ```bash
 .venv/bin/brag index --force

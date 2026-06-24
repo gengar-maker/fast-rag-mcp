@@ -16,6 +16,7 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
+
 def _package_version(name: str) -> str:
     try:
         return metadata.version(name)
@@ -180,7 +181,7 @@ class EmbeddingModel:
                     )
                 if env["transformers"].split(".", 1)[0] == "5":
                     hints.append(
-                        "CodeRankEmbed is incompatible with Transformers 5.x; install the pinned 4.45.1 release"
+                        "CodeRankEmbed is incompatible with Transformers 5.x; install the pinned 4.47.1 release"
                     )
                 details = "; ".join(f"{key}={value}" for key, value in env.items())
                 hint_text = f" Hints: {'; '.join(hints)}." if hints else ""
@@ -244,11 +245,15 @@ class EmbeddingModel:
         except Exception as exc:
             log.debug("device cache cleanup failed: %s", exc)
 
-    def embed_texts(self, texts: list[str], *, is_query: bool = False) -> np.ndarray:
+    def embed_texts(
+        self, texts: list[str], *, is_query: bool = False, query_prefix: str | None = None
+    ) -> np.ndarray:
         if not texts:
             return np.zeros((0, self._dim), dtype="float32")
         if is_query:
-            prefix = self.settings.embedding_query_prefix.strip()
+            prefix = (
+                query_prefix if query_prefix is not None else self.settings.embedding_query_prefix
+            ).strip()
             if not prefix and self.settings.embedding_model.lower().endswith("coderankembed"):
                 prefix = "Represent this query for searching relevant code:"
             if prefix:
@@ -302,15 +307,15 @@ class EmbeddingModel:
             return np.asarray(arr, dtype="float32")
         return self._hash_embed(texts)
 
-    def embed_query(self, query: str) -> np.ndarray:
+    def embed_query(self, query: str, *, query_prefix: str | None = None) -> np.ndarray:
         key = hashlib.blake2b(
-            f"{self.index_key}\x1fquery\x1f{query}".encode(),
+            f"{self.index_key}\x1fquery\x1f{query_prefix or ''}\x1f{query}".encode(),
             digest_size=16,
         ).hexdigest()
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        arr = self.embed_texts([query], is_query=True)[0]
+        arr = self.embed_texts([query], is_query=True, query_prefix=query_prefix)[0]
         self._cache[key] = arr
         return arr
 

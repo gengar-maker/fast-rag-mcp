@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0
+
+- Added production PDF ingestion through the optional `documents` extra (`PyMuPDF`).
+- Added page-aware `pdf_text`, `pdf_code`, and optional `pdf_table` chunks.
+- Added repeated header/footer suppression, heading and monospace-block detection, page labels, bounding boxes, encrypted-PDF handling, streaming file hashes, and bounded page/character limits.
+- Added opt-in Tesseract OCR modes: `off`, `auto`, and `always`.
+- Added `document_search`, `document_outline`, `document_fetch`, and `document_update_index` MCP tools plus `brag docs` and `brag outline` CLI commands.
+- Added PDF-only FTS filtering and dense-result oversampling with document-specific query prefixing.
+- Added contextual adjacent-chunk fetch and page citations.
+- Bumped persisted index format to 3; a one-time forced rebuild is required.
+- Added PDF extraction/index/search tests.
+- Updated the Python 3.14 installation path to `transformers==4.47.1` and `tokenizers==0.21.4`; the latter ships an ABI3 wheel and avoids a local Rust build.
+
 ## 1.0.1
 
 - Pin `sentence-transformers==3.4.1` and `transformers==4.45.1` for CodeRankEmbed compatibility.

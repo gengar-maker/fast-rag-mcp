@@ -33,9 +33,8 @@ class IndexMutationLock:
                     handle.write(b"\0")
                     handle.flush()
                 handle.seek(0)
-                msvcrt.locking(  # type: ignore[attr-defined]
-                    handle.fileno(), msvcrt.LK_NBLCK, 1  # type: ignore[attr-defined]
-                )
+                lock_mode = msvcrt.LK_NBLCK  # type: ignore[attr-defined]
+                msvcrt.locking(handle.fileno(), lock_mode, 1)  # type: ignore[attr-defined]
             else:
                 handle.close()
                 raise RuntimeError(f"unsupported platform for index lock: {os.name}")
@@ -58,9 +57,8 @@ class IndexMutationLock:
                 import msvcrt
 
                 handle.seek(0)
-                msvcrt.locking(  # type: ignore[attr-defined]
-                    handle.fileno(), msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
-                )
+                unlock_mode = msvcrt.LK_UNLCK  # type: ignore[attr-defined]
+                msvcrt.locking(handle.fileno(), unlock_mode, 1)  # type: ignore[attr-defined]
         finally:
             handle.close()
             self._file = None

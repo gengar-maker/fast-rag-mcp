@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-INDEX_FORMAT_VERSION = 2
+INDEX_FORMAT_VERSION = 3
 
 
 def _split_paths(value: str | list[str]) -> list[str]:
@@ -32,6 +32,7 @@ class Settings(BaseSettings):
             "**/*.mdx",
             "**/*.txt",
             "**/*.rst",
+            "**/*.pdf",
             "**/*.py",
             "**/*.ts",
             "**/*.tsx",
@@ -143,6 +144,19 @@ class Settings(BaseSettings):
     exclude_hidden_dirs: bool = True
     include_hidden_dir_names: set[str] = Field(default_factory=lambda: {".github"})
     max_file_bytes: int = 750_000
+    max_pdf_bytes: int = 200_000_000
+    pdf_max_pages: int = 2_000
+    pdf_max_chars: int = 20_000_000
+    pdf_chunk_tokens: int = 512
+    pdf_chunk_overlap: int = 48
+    pdf_ocr_mode: Literal["off", "auto", "always"] = "off"
+    pdf_ocr_language: str = "eng"
+    pdf_ocr_dpi: int = 200
+    pdf_ocr_min_chars: int = 48
+    pdf_extract_tables: bool = False
+    pdf_password: str = ""
+    pdf_dense_candidate_multiplier: int = 8
+    pdf_query_prefix: str = "Represent this query for retrieving relevant technical documentation:"
     max_files: int = 250_000
     max_targeted_paths: int = 256
     scan_backend: Literal["auto", "git", "walk"] = "auto"
@@ -210,6 +224,13 @@ class Settings(BaseSettings):
 
     @field_validator(
         "max_file_bytes",
+        "max_pdf_bytes",
+        "pdf_max_pages",
+        "pdf_max_chars",
+        "pdf_chunk_tokens",
+        "pdf_ocr_dpi",
+        "pdf_ocr_min_chars",
+        "pdf_dense_candidate_multiplier",
         "max_files",
         "max_targeted_paths",
         "embedding_batch_size",
@@ -239,7 +260,7 @@ class Settings(BaseSettings):
             raise ValueError("must be greater than zero")
         return value
 
-    @field_validator("chunk_overlap")
+    @field_validator("chunk_overlap", "pdf_chunk_overlap")
     @classmethod
     def non_negative_overlap(cls, value: int) -> int:
         if value < 0:
@@ -302,6 +323,13 @@ class Settings(BaseSettings):
             "min_chunk_chars": self.min_chunk_chars,
             "add_file_summary_chunks": self.add_file_summary_chunks,
             "vector_storage_dtype": self.vector_storage_dtype,
+            "pdf_extractor": "pymupdf-v1",
+            "pdf_chunk_tokens": self.pdf_chunk_tokens,
+            "pdf_chunk_overlap": self.pdf_chunk_overlap,
+            "pdf_ocr_mode": self.pdf_ocr_mode,
+            "pdf_ocr_language": self.pdf_ocr_language,
+            "pdf_ocr_dpi": self.pdf_ocr_dpi,
+            "pdf_extract_tables": self.pdf_extract_tables,
         }
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.blake2b(raw, digest_size=20).hexdigest()

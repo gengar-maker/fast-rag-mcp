@@ -53,6 +53,44 @@ def code_search(
 
 
 @mcp.tool()
+def document_search(
+    query: str,
+    top_k: int | None = None,
+    mode: Literal["hybrid", "semantic", "keyword"] = "hybrid",
+    path_prefix: str | None = None,
+    include_text: bool = False,
+) -> dict:
+    """Search indexed PDF documentation and return page-aware citations."""
+    return _app.document_search(
+        query=query,
+        top_k=top_k,
+        mode=mode,
+        path_prefix=path_prefix,
+        include_text=include_text,
+    )
+
+
+@mcp.tool()
+def document_outline(path_or_doc_id: str, limit: int = 500) -> dict:
+    """List page/section anchors for an indexed PDF without loading dense retrieval."""
+    return _app.document_outline(path_or_doc_id=path_or_doc_id, limit=limit)
+
+
+@mcp.tool()
+def document_fetch(
+    resource_uri: str | None = None,
+    chunk_id: str | None = None,
+    context_chunks: int = 1,
+) -> dict:
+    """Fetch a PDF chunk with adjacent context and page metadata."""
+    return _app.fetch(
+        resource_uri=resource_uri,
+        chunk_id=chunk_id,
+        context_chunks=context_chunks,
+    )
+
+
+@mcp.tool()
 def code_find_symbol(
     name: str,
     kind: str | None = None,
@@ -93,6 +131,22 @@ def code_fetch(
 ) -> dict:
     """Fetch full text for a rag:// chunk or symbol:// symbol."""
     return _app.fetch(resource_uri=resource_uri, chunk_id=chunk_id, symbol_id=symbol_id)
+
+
+@mcp.tool()
+def document_update_index(paths: list[str], refresh_vectors: bool = False) -> dict:
+    """Incrementally index selected PDF files/directories without scanning all roots."""
+    try:
+        return {
+            "ok": True,
+            **_app.reindex(
+                paths=paths,
+                refresh_vectors=refresh_vectors,
+                enforce_mcp_policy=True,
+            ),
+        }
+    except Exception as exc:
+        return _error(exc)
 
 
 @mcp.tool()

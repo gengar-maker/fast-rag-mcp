@@ -178,6 +178,14 @@ class Application:
         with self._lock:
             return self._get_retriever().code_search(**kwargs)
 
+    def document_search(self, **kwargs: Any) -> dict:
+        with self._lock:
+            return self._get_retriever().document_search(**kwargs)
+
+    def document_outline(self, **kwargs: Any) -> dict:
+        with self._lock:
+            return self._get_retriever().document_outline(**kwargs)
+
     def find_symbol(self, **kwargs: Any) -> dict:
         with self._lock:
             return self._get_retriever().find_symbol(**kwargs)
@@ -341,6 +349,13 @@ class Application:
                     "read_only": self.settings.read_only,
                     "allow_reindex_tool": self.settings.allow_reindex_tool,
                     "mps_enable_fallback": self.settings.mps_enable_fallback,
+                    "pdf": {
+                        "max_pdf_bytes": self.settings.max_pdf_bytes,
+                        "max_pages": self.settings.pdf_max_pages,
+                        "chunk_tokens": self.settings.pdf_chunk_tokens,
+                        "ocr_mode": self.settings.pdf_ocr_mode,
+                        "extract_tables": self.settings.pdf_extract_tables,
+                    },
                     "index_fingerprint": self.settings.index_fingerprint(),
                 },
                 "embedding_environment": embedding_environment(),
@@ -394,7 +409,9 @@ class Application:
             checks["database_ok"] = database_ok
             checks["index_state_ok"] = state_ok
             return {
-                "ok": bool(database_ok and checks["fingerprint_matches"] and state_ok and embedding_ok),
+                "ok": bool(
+                    database_ok and checks["fingerprint_matches"] and state_ok and embedding_ok
+                ),
                 "checks": checks,
                 "warnings": self._configuration_warnings(),
             }

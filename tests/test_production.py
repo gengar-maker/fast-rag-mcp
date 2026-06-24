@@ -181,8 +181,7 @@ def test_symbol_and_chunk_ids_survive_unrelated_prefix_edit():
         return symbols, chunks
 
     before = (
-        "def stable(value):\n    return value + 1\n\n"
-        "def second(value):\n    return value * 2\n"
+        "def stable(value):\n    return value + 1\n\ndef second(value):\n    return value * 2\n"
     )
     after = "# unrelated header\n\n" + before
     before_symbols, before_chunks = build(before, "before")

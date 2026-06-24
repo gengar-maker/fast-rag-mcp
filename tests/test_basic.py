@@ -235,10 +235,7 @@ def test_member_calls_are_indexed_as_references(tmp_path):
     repo.mkdir()
     path = repo / "service.py"
     path.write_text(
-        "class Service:\n"
-        "    def run(self):\n"
-        "        self.validate()\n"
-        "        client.fetch()\n",
+        "class Service:\n    def run(self):\n        self.validate()\n        client.fetch()\n",
         encoding="utf-8",
     )
     settings = Settings(roots=[repo.as_posix()], db_dir=tmp_path / "db")
