@@ -1,4 +1,4 @@
-# Production audit - PDF documentation release 1.1.0
+# Production audit - PDF documentation release 1.1.1
 
 ## Added PDF path
 

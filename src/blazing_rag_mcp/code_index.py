@@ -30,6 +30,8 @@ EXT_LANGUAGE: dict[str, str] = {
     ".cc": "cpp",
     ".cpp": "cpp",
     ".cxx": "cpp",
+    ".cu": "cpp",
+    ".cuh": "cpp",
     ".hpp": "cpp",
     ".hh": "cpp",
     ".cs": "c_sharp",

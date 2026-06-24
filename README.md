@@ -1,6 +1,6 @@
 # blazing-rag-mcp 1.1
 
-Production-oriented local code and PDF-documentation MCP server for Claude Code and opencode. It combines structural code indexing, page-aware PDF extraction, exact symbol/path lookup, SQLite FTS5, shallow reference extraction, and optional dense retrieval accelerated by Apple Metal/MPS or CUDA.
+Production-oriented local code and PDF-documentation MCP server for Claude Code and opencode. CUDA `.cu` / `.cuh` files are indexed structurally as C++, while `contrib` directories are excluded by default. It combines structural code indexing, page-aware PDF extraction, exact symbol/path lookup, SQLite FTS5, shallow reference extraction, and optional dense retrieval accelerated by Apple Metal/MPS or CUDA.
 
 The server is optimized for a persistent local MCP process. Heavy resources are lazy: Claude can complete the MCP handshake before PyTorch, the embedding model, or the vector matrix are loaded.
 

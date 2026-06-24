@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1
+
+- Added `.cu` and `.cuh` to default scanner extensions and include globs.
+- Parse CUDA source and headers with the C++ structural parser.
+- Exclude every directory named `contrib`, including nested paths and Git-backed scans.
+- Added scanner regression tests for CUDA files and `contrib` exclusion.
+
 ## 1.1.0
 
 - Added production PDF ingestion through the optional `documents` extra (`PyMuPDF`).

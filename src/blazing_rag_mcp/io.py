@@ -36,6 +36,8 @@ TEXT_EXTENSIONS = {
     ".cc",
     ".cpp",
     ".cxx",
+    ".cu",
+    ".cuh",
     ".h",
     ".hpp",
     ".hh",

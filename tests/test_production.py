@@ -331,3 +331,62 @@ def test_application_query_store_is_sqlite_read_only(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         store.conn.execute("INSERT INTO meta(key, value) VALUES ('forbidden', '1')")
     app.close()
+
+
+def test_cuda_extensions_are_indexed_and_contrib_is_excluded(tmp_path):
+    from blazing_rag_mcp.code_index import detect_language
+    from blazing_rag_mcp.io import ScanStats, iter_candidate_files
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "kernel.cu").write_text(
+        '__global__ void kernel(float *x) { x[threadIdx.x] = 1.0f; }\n',
+        encoding="utf-8",
+    )
+    (repo / "kernel.cuh").write_text(
+        '__device__ inline float helper(float x) { return x * 2.0f; }\n',
+        encoding="utf-8",
+    )
+    nested = repo / "src" / "contrib"
+    nested.mkdir(parents=True)
+    (nested / "ignored.cu").write_text('__global__ void ignored() {}\n', encoding="utf-8")
+    top_level = repo / "contrib"
+    top_level.mkdir()
+    (top_level / "ignored.cuh").write_text('__device__ void ignored();\n', encoding="utf-8")
+
+    settings = Settings(roots=[repo.as_posix()], scan_backend="walk")
+    stats = ScanStats()
+    paths = {path.relative_to(repo).as_posix() for path in iter_candidate_files(settings, stats)}
+
+    assert "kernel.cu" in paths
+    assert "kernel.cuh" in paths
+    assert "src/contrib/ignored.cu" not in paths
+    assert "contrib/ignored.cuh" not in paths
+    assert detect_language(Path("kernel.cu")) == "cpp"
+    assert detect_language(Path("kernel.cuh")) == "cpp"
+
+
+def test_git_scanner_filters_contrib_cuda_files(tmp_path):
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+
+    from blazing_rag_mcp.io import ScanStats, iter_candidate_files
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", repo.as_posix()], check=True)
+    (repo / "main.cu").write_text('__global__ void main_kernel() {}\n', encoding="utf-8")
+    contrib = repo / "contrib"
+    contrib.mkdir()
+    (contrib / "ignored.cuh").write_text('__device__ void ignored();\n', encoding="utf-8")
+    subprocess.run(["git", "-C", repo.as_posix(), "add", "main.cu", "contrib/ignored.cuh"], check=True)
+
+    settings = Settings(roots=[repo.as_posix()], scan_backend="git")
+    stats = ScanStats()
+    paths = {path.relative_to(repo).as_posix() for path in iter_candidate_files(settings, stats)}
+
+    assert "main.cu" in paths
+    assert "contrib/ignored.cuh" not in paths
